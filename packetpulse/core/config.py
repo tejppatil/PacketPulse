@@ -86,10 +86,35 @@ class PacketPulseConfig:
 _config: Optional[PacketPulseConfig] = None
 
 
+def _load_local_env() -> None:
+    """Load key=value pairs from local .env (if present) into os.environ.
+
+    This keeps secrets local-only and avoids hardcoding credentials in source.
+    """
+    env_path = Path(__file__).resolve().parents[2] / ".env"
+    if not env_path.exists():
+        return
+
+    try:
+        for raw in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and value and key not in os.environ:
+                os.environ[key] = value
+    except Exception:
+        # Keep startup resilient even if local .env has formatting issues.
+        pass
+
+
 def get_config() -> PacketPulseConfig:
     global _config
     if _config is None:
         _config = PacketPulseConfig()
+        _load_local_env()
         # Load optional API keys from environment only.
         vt = os.environ.get("PACKETPULSE_VT_KEY", "")
         gsb = os.environ.get("PACKETPULSE_GSB_KEY", "")
