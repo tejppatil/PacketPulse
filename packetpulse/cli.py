@@ -154,7 +154,7 @@ def _render_banner_frame(phase: int) -> Panel:
             "[bold bright_green]:: TERMINAL CYBERSECURITY MONITORING PLATFORM ::[/bold bright_green]\n"
             "[bold bright_cyan]:: HACKER VIBE // BLUE TEAM POWER ::[/bold bright_cyan]\n"
             "[bright_cyan]made by Dreamwalker4u[/bright_cyan]\n"
-            "[dim]Version 1.0.1  |  MIT License  |  Threat-Hunting Console[/dim]"
+            "[dim]Version 1.0.2  |  MIT License  |  Threat-Hunting Console[/dim]"
         ),
         box=box.DOUBLE,
         title="[bold bright_green] PACKETPULSE // NEON GRID [/bold bright_green]",

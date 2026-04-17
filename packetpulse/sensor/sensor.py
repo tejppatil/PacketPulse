@@ -888,7 +888,7 @@ tr:hover td{{background:#0d110d}}
   </div>
   <div class="fr">
     <div class="fb">PacketPulse | Dreamwalker4u</div>
-    <div class="fs">Network Forensics Platform  •  v1.0.1</div>
+    <div class="fs">Network Forensics Platform  •  v1.0.2</div>
   </div>
 </div>
 <div class="wm">PacketPulse | Dreamwalker4u  •  Network Forensic Capture Report  •  {ts_str}</div>

@@ -436,7 +436,7 @@ class URLAnalyzer:
         if gsb_key:
             try:
                 payload = {
-                    "client": {"clientId": "packetpulse", "clientVersion": "1.0.1"},
+                    "client": {"clientId": "packetpulse", "clientVersion": "1.0.2"},
                     "threatInfo": {
                         "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
                         "platformTypes": ["ANY_PLATFORM"],

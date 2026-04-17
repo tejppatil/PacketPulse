@@ -736,7 +736,7 @@ def _generate_enject_report(data: dict, save_path: str) -> str:
         "__meta": {
             "tool":      "PacketPulse",
             "author":    "Dreamwalker4u",
-            "version":   "1.0.1",
+            "version":   "1.0.2",
             "format":    "enject-forensics-v1",
             "generated": now_str(),
             "platform":  platform.system(),
