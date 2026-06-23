@@ -31,6 +31,10 @@ duration, options — then runs, then returns you to the menu.
 
 ---
 
+<img width="1059" height="748" alt="image" src="https://github.com/user-attachments/assets/de2f3a62-905f-4731-9ae2-13ecc51239a5" />
+
+
+---
 ## Each module
 
 ### 1 — Packet Sniffer
