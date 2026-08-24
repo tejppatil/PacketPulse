@@ -21,10 +21,41 @@ on:
   push:
     tags:
       - "v*"
+  pull_request:
+  workflow_call:
 
 jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      - name: Install package and dev dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+
+      - name: Lint
+        run: python -m ruff check packetpulse tests
+
+      - name: Unit tests
+        run: python -m pytest tests -q
+
   build:
     name: Build distributions
+    needs: [test]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -41,6 +72,26 @@ jobs:
       - name: Build wheel and sdist
         run: python -m build
 
+      # Packaging errors are invisible when testing from a checkout: this
+      # installs the built wheel into a clean environment and runs the entry
+      # point, which is how a missing module or dependency actually surfaces.
+      - name: Verify the wheel installs and runs standalone
+        run: |
+          python -m venv /tmp/verify
+          /tmp/verify/bin/python -m pip install --upgrade pip
+          /tmp/verify/bin/python -m pip install dist/*.whl
+          cd /tmp
+          /tmp/verify/bin/python -c "
+          import packetpulse
+          from packetpulse.core import capabilities
+          from packetpulse.core.session import Session
+          from packetpulse import cli, sensor, dns, urlscan, forensics
+          print('version', packetpulse.__version__)
+          print('capabilities probed:', len(capabilities.probe_all()))
+          assert Session(module='ci').status() == 'FAIL'
+          print('clean-environment import OK')
+          "
+
       - name: Upload dist artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -49,7 +100,7 @@ jobs:
 
   publish-testpypi:
     name: Publish to TestPyPI
-    needs: build
+    needs: [build]
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.repository == 'testpypi'
     permissions:
@@ -70,9 +121,9 @@ jobs:
 
   publish-pypi:
     name: Publish to PyPI
-    needs: build
+    needs: [build]
     runs-on: ubuntu-latest
-    if: (github.event_name == 'workflow_dispatch' && github.event.inputs.repository == 'pypi') || github.event_name == 'push'
+    if: (github.event_name == 'workflow_dispatch' && github.event.inputs.repository == 'pypi') || startsWith(github.ref, 'refs/tags/v')
     permissions:
       id-token: write
     environment:

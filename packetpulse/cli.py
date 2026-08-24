@@ -13,11 +13,10 @@ from __future__ import annotations
 import os
 import sys
 import time
-import signal
 import threading
-import subprocess
+import platform
+import traceback
 from datetime import datetime
-from typing import Optional
 
 # Allow `python cli.py` to work when executed from the package directory.
 if __package__ is None or __package__ == "":
@@ -34,6 +33,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+from packetpulse import __version__
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -42,6 +42,7 @@ from rich import box
 
 console = Console()
 _INTRO_ANIM_PLAYED = False
+_ENGINE_LOADED = False
 
 # ── Colours / helpers ─────────────────────────────────────────────────────────
 
@@ -88,24 +89,48 @@ def _ask_yn(prompt: str, default: bool = True) -> bool:
     return val.lower().startswith("y")
 
 def _check_root() -> bool:
-    return os.name == "posix" and os.geteuid() == 0
+    """Elevation check that is correct on every platform."""
+    from packetpulse.core import capabilities
+    return capabilities.is_admin()
 
 def _root_warn() -> None:
-    if not _check_root():
+    """Warn only when capture is genuinely unavailable, with correct advice.
+
+    Npcap can be installed in a mode permitting non-administrator capture, so
+    lack of elevation does not by itself mean capture will fail — we probe the
+    real capability instead of telling Windows users to run sudo.
+    """
+    from packetpulse.core import capabilities
+    cap = capabilities.probe_capture()
+    if not cap.available:
+        console.print(f"\n  [red]Packet capture UNAVAILABLE:[/red] {cap.reason}")
+        console.print(f"  [dim]{capabilities.privilege_hint()}[/dim]\n")
+    elif not capabilities.is_admin():
         console.print(
-            "\n  [yellow]⚠  This module requires root/sudo.[/yellow]"
-            "\n  [dim]  Rerun with: sudo packetpulse[/dim]\n"
+            "\n  [dim]Running without elevation: capture works, but process"
+            " attribution for other users' sockets will report UNKNOWN.[/dim]\n"
         )
 
 def _net_interfaces() -> list[str]:
-    """Return available network interfaces."""
+    """Interfaces available for capture, route interface first.
+
+    The routing interface is offered first because on a host with a VPN tunnel
+    it differs from the platform default, and capturing on the wrong one shows
+    only local broadcast traffic.
+    """
+    from packetpulse.core import capabilities
+    names: list[str] = []
+    routed = capabilities.default_route_interface()
+    if routed:
+        names.append(routed)
     try:
         import psutil
-        ifaces = list(psutil.net_if_stats().keys())
-        # filter loopback and virtual
-        return [i for i in ifaces if not i.startswith("lo")] or ifaces
-    except Exception:
-        return ["eth0", "wlan0", "en0"]
+        for i in psutil.net_if_stats().keys():
+            if i not in names and not i.startswith("lo"):
+                names.append(i)
+    except (ImportError, OSError) as e:
+        console.print(f"  [yellow]Could not enumerate interfaces: {e}[/yellow]")
+    return names
 
 def _ensure_dirs() -> None:
     for d in ["pcap_store", "pcap_store/urls", "pcap_store/dns", "pcap_store/forensics"]:
@@ -154,7 +179,7 @@ def _render_banner_frame(phase: int) -> Panel:
             "[bold bright_green]:: TERMINAL CYBERSECURITY MONITORING PLATFORM ::[/bold bright_green]\n"
             "[bold bright_cyan]:: HACKER VIBE // BLUE TEAM POWER ::[/bold bright_cyan]\n"
             "[bright_cyan]made by Dreamwalker4u[/bright_cyan]\n"
-            "[dim]Version 1.0.2  |  MIT License  |  Threat-Hunting Console[/dim]"
+            f"[dim]Version {__version__}  |  MIT License  |  Threat-Hunting Console[/dim]"
         ),
         box=box.DOUBLE,
         title="[bold bright_green] PACKETPULSE // NEON GRID [/bold bright_green]",
@@ -164,23 +189,29 @@ def _render_banner_frame(phase: int) -> Panel:
     )
 
 
+def _clear_screen() -> None:
+    """Clear the terminal without spawning a shell."""
+    console.clear()
+
+
 def _play_intro_animation() -> None:
     for phase in range(16):
-        os.system("clear" if os.name == "posix" else "cls")
+        _clear_screen()
         console.print(_render_banner_frame(phase))
         time.sleep(0.045)
 
 
 def _print_banner() -> None:
     global _INTRO_ANIM_PLAYED
-    os.system("clear" if os.name == "posix" else "cls")
+    _clear_screen()
     if not _INTRO_ANIM_PLAYED:
         _play_intro_animation()
         _INTRO_ANIM_PLAYED = True
-        os.system("clear" if os.name == "posix" else "cls")
+        _clear_screen()
 
     console.print(_render_banner_frame(16))
-    root_status = "[green]root [OK][/green]" if _check_root() else "[yellow]no root [WARN][/yellow]"
+    root_status = ("[green]elevated[/green]" if _check_root()
+                   else "[yellow]not elevated[/yellow]")
     ts = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
     console.print(f"  [bold cyan]{ts}[/bold cyan]  [dim]|[/dim]  {root_status}")
     console.print()
@@ -196,6 +227,7 @@ MENU_ITEMS = [
     ("3", "DNS Monitor",      "Watch every DNS query - flag DGA domains, beaconing, bad TLDs"),
     ("4", "Device Forensics", "Profile USB devices and LAN devices in depth"),
     ("5", "Full Pipeline",    "Run Sniffer + URL Scanner + DNS Monitor simultaneously"),
+    ("6", "Capabilities",     "What this host can and cannot do, and why"),
     ("0", "Exit",             ""),
 ]
 
@@ -316,16 +348,17 @@ def _module_sniffer() -> None:
     )
     console.print()
 
+    _load_capture_engine()
     from packetpulse.sensor.sensor import run_sniffer
 
-    run_sniffer(
+    session = run_sniffer(
         interface=iface,
         bpf_filter=bpf,
         count=0,
         duration=duration_secs,
-        save_pcap=save_pcap
+        save_pcap=save_pcap,
     )
-
+    _report_outcome(session)
     _press_enter()
 
 
@@ -366,7 +399,11 @@ def _module_urlscan() -> None:
 
         console.print()
         fetch_page = _ask_yn("Scan page content? (fetches the page, slower but thorough)", True)
-        check_rep  = _ask_yn("Check reputation (VirusTotal, PhishTank, Safe Browsing)?", True)
+        console.print(
+            "\n  [dim]Reputation checks send this URL to VirusTotal, Google Safe\n"
+            "  Browsing and PhishTank. They require API keys and are optional.[/dim]"
+        )
+        check_rep = _ask_yn("Send this URL to external reputation services?", False)
 
         console.print()
         console.print(_hr())
@@ -381,11 +418,13 @@ def _module_urlscan() -> None:
         from packetpulse.core.config import get_config
         cfg = get_config()
         cfg.urlscan.fetch_page = fetch_page
+        cfg.urlscan.allow_external = check_rep
 
         _ensure_dirs()
         console.print()
         from packetpulse.urlscan.url_scanner import scan_url
-        scan_url(url)
+        session = scan_url(url)
+        _report_outcome(session)
 
     else:
         # ── live mode ─────────────────────────────────────────────────────────
@@ -407,7 +446,7 @@ def _module_urlscan() -> None:
 
         console.print()
         console.print(_hr())
-        console.print(f"  [dim]Mode      :[/dim] [green]Live traffic watch[/green]")
+        console.print("  [dim]Mode      :[/dim] [green]Live traffic watch[/green]")
         console.print(f"  [dim]Interface :[/dim] [green]{iface}[/green]")
         console.print(f"  [dim]Duration  :[/dim] [yellow]{dur_label}[/yellow]")
         console.print(_hr())
@@ -422,18 +461,11 @@ def _module_urlscan() -> None:
         )
         console.print("  [dim]Browse normally — any suspicious URL will be flagged below.[/dim]\n")
 
+        _load_capture_engine()
         from packetpulse.urlscan.url_scanner import run_live_urlscan
-        if duration_secs:
-            t = threading.Thread(target=run_live_urlscan,
-                                 kwargs={"interface": iface}, daemon=True)
-            t.start()
-            try:
-                time.sleep(duration_secs)
-            except KeyboardInterrupt:
-                pass
-            console.print(f"\n  [green]Live watch complete.[/green]  Duration: {dur_label}")
-        else:
-            run_live_urlscan(interface=iface)
+
+        session = run_live_urlscan(interface=iface, duration=duration_secs)
+        _report_outcome(session)
 
     _press_enter()
 
@@ -498,22 +530,14 @@ def _module_dns() -> None:
     )
     console.print()
 
+    _load_capture_engine()
     from packetpulse.dns.dns_monitor import run_dns_monitor
-    if duration_secs:
-        t = threading.Thread(
-            target=run_dns_monitor,
-            kwargs={"interface": iface, "duration": duration_secs},
-            daemon=True,
-        )
-        t.start()
-        try:
-            time.sleep(duration_secs)
-        except KeyboardInterrupt:
-            pass
-        console.print(f"\n  [green]DNS monitor complete.[/green]  Duration: {dur_label}")
-    else:
-        run_dns_monitor(interface=iface)
 
+    # Run in this thread: the module honours `duration` itself and returns only
+    # after it has stopped. The previous daemon-thread + sleep left the capture
+    # running in the background after printing "complete".
+    session = run_dns_monitor(interface=iface, duration=duration_secs)
+    _report_outcome(session)
     _press_enter()
 
 
@@ -552,12 +576,18 @@ def _module_forensics() -> None:
             "\n  [dim]Subnet examples:[/dim]  192.168.1.0/24  •  10.0.0.0/24  •  (leave blank = auto-detect)[/dim]"
         )
         subnet = _ask("Subnet to scan", "")
-        nmap_enabled = _ask_yn(
-            "\n  Run active nmap scan? (finds open ports & services — takes longer, needs sudo)", True
-        )
+        from packetpulse.core import capabilities
+        nmap_cap = capabilities.probe_all()["nmap"]
+        if nmap_cap.available:
+            nmap_enabled = _ask_yn(
+                "\n  Run active nmap port scan? (slower; scans hosts you must be "
+                "authorised to scan)", False)
+        else:
+            console.print(f"\n  [yellow]Active port scan UNAVAILABLE:[/yellow] {nmap_cap.reason}")
+            nmap_enabled = False
 
-    if not usb_watch:
-        save_json = _ask_yn("\nSave device profiles to pcap_store/forensics/?", True)
+    # (Device profiles are always written; the previous prompt collected an
+    # answer that was never applied to anything.)
 
     console.print()
     console.print(_hr())
@@ -587,7 +617,8 @@ def _module_forensics() -> None:
     if usb_watch:
         run_usb_watch()
     else:
-        run_forensics(subnet=subnet or None, no_nmap=not nmap_enabled)
+        session = run_forensics(subnet=subnet or None, no_nmap=not nmap_enabled)
+        _report_outcome(session)
 
     _press_enter()
 
@@ -596,104 +627,223 @@ def _module_forensics() -> None:
 # MODULE  5 — FULL PIPELINE
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _module_capabilities() -> None:
+    """Show what actually works on this host, with reasons for what does not."""
+    from packetpulse.core import capabilities
+
+    console.print()
+    console.rule("[bold cyan]  HOST CAPABILITIES  [/bold cyan]")
+    console.print()
+    console.print(f"  [dim]Platform      :[/dim] [green]{platform.system()} {platform.release()}[/green]")
+    console.print(f"  [dim]Elevated      :[/dim] "
+                  f"{'[green]YES[/green]' if capabilities.is_admin() else '[yellow]NO[/yellow]'}")
+    console.print(f"  [dim]Route iface   :[/dim] "
+                  f"[cyan]{capabilities.default_route_interface() or 'UNKNOWN'}[/cyan]")
+    console.print()
+    for line in capabilities.describe():
+        console.print(line)
+    console.print()
+    console.print("  [bold]Module support on this host[/bold]")
+    for mod, level in capabilities.platform_support().items():
+        colour = ("green" if level == capabilities.SUPPORTED
+                  else "yellow" if level == capabilities.PARTIAL else "red")
+        console.print(f"    [{colour}]{level:22}[/{colour}] {mod}")
+    if not capabilities.is_admin():
+        console.print(f"\n  [dim]{capabilities.privilege_hint()}[/dim]")
+    _press_enter()
+
+
 def _module_pipeline() -> None:
-    _root_warn()
+    """Run sniffer + URL watcher + DNS monitor against one shared lifecycle."""
+    from packetpulse.core import capabilities
+    from packetpulse.core.session import StopController
+
     console.print()
     console.rule("[bold cyan]  FULL PIPELINE  [/bold cyan]")
     console.print(
-        "\n  Runs Packet Sniffer + URL Scanner + DNS Monitor simultaneously.\n"
-        "  [dim]All three modules run in parallel threads, output streams to this terminal.[/dim]\n"
+        "\n  Runs Packet Sniffer + URL Scanner + DNS Monitor together.\n"
+        "  [dim]All three share one interface, one duration and one stop signal.[/dim]\n"
     )
 
+    cap = capabilities.probe_capture()
+    if not cap.available:
+        console.print(f"  [red]Packet capture UNAVAILABLE:[/red] {cap.reason}")
+        console.print(f"  [dim]{capabilities.privilege_hint()}[/dim]")
+        _press_enter()
+        return
+
     ifaces = _net_interfaces()
-    console.print("  [dim]Available interfaces:[/dim]  " +
-                  "  ".join(f"[cyan]{i}[/cyan]" for i in ifaces))
-    iface = _ask("Network interface (used by all modules)", ifaces[0] if ifaces else "eth0")
+    routed = capabilities.default_route_interface()
+    if routed:
+        console.print(f"  [dim]Outbound traffic on this host routes via[/dim] [cyan]{routed}[/cyan]")
+    default_iface = routed or (ifaces[0] if ifaces else "")
+    iface = _ask("Network interface (shared by all modules)", default_iface)
 
-    dur_raw = _ask("\nHow long to run (e.g. 10m, 1h, 0 = until Ctrl+C)", "0")
-    duration_secs = _parse_duration(dur_raw)
-    dur_label = _fmt_duration(duration_secs)
+    ok, detail = capabilities.resolve_interface(iface)
+    if not ok:
+        console.print(f"  [red]{detail}[/red]")
+        _press_enter()
+        return
+
+    dur_raw = _ask("How long to run (e.g. 60s, 10m; 0 = until Ctrl+C)", "60s")
+    duration = _parse_duration(dur_raw)
+    if duration == 0:
+        console.print("  [yellow]The pipeline needs a bounded duration so all modules can be "
+                      "stopped together. Using 60s.[/yellow]")
+        duration = 60
 
     console.print()
-    en_sniff = _ask_yn("Enable Packet Sniffer?",  True)
-    en_url   = _ask_yn("Enable URL Scanner?",     True)
-    en_dns   = _ask_yn("Enable DNS Monitor?",     True)
+    en_sniff = _ask_yn("Enable Packet Sniffer?", True)
+    en_url = _ask_yn("Enable URL Scanner?", True)
+    en_dns = _ask_yn("Enable DNS Monitor?", True)
+    if not (en_sniff or en_url or en_dns):
+        console.print("  [yellow]No modules selected.[/yellow]")
+        _press_enter()
+        return
 
     console.print()
     console.print(_hr())
-    console.print(f"  [dim]Interface     :[/dim] [green]{iface}[/green]")
-    console.print(f"  [dim]Duration      :[/dim] [yellow]{dur_label}[/yellow]")
-    console.print(f"  [dim]Pkt Sniffer   :[/dim] {'[green]ON[/green]' if en_sniff else '[dim]OFF[/dim]'}")
-    console.print(f"  [dim]URL Scanner   :[/dim] {'[green]ON[/green]' if en_url   else '[dim]OFF[/dim]'}")
-    console.print(f"  [dim]DNS Monitor   :[/dim] {'[green]ON[/green]' if en_dns   else '[dim]OFF[/dim]'}")
+    console.print(f"  [dim]Interface :[/dim] [green]{iface or 'default'}[/green]")
+    console.print(f"  [dim]Duration  :[/dim] [yellow]{_fmt_duration(duration)}[/yellow]")
+    console.print(f"  [dim]Modules   :[/dim] "
+                  f"{'Sniffer ' if en_sniff else ''}{'URLScan ' if en_url else ''}{'DNS' if en_dns else ''}")
     console.print(_hr())
-
-    if not _ask_yn("\n  Launch full pipeline?", True):
+    if not _ask_yn("\n  Launch pipeline?", True):
         return
 
     _ensure_dirs()
-    threads = []
-    errors  = []
+    _load_capture_engine()
+    stop = StopController()
+    results: dict = {}
+    failures: dict = {}
 
-    def _run(target, kwargs):
+    def _runner(name, fn, kwargs):
         try:
-            target(**kwargs)
-        except Exception as e:
-            errors.append(str(e))
+            results[name] = fn(**kwargs)
+        except Exception as e:                      # module crash must not hide
+            failures[name] = f"{type(e).__name__}: {e}"
+            log_exc = traceback.format_exc()
+            failures[name + "_trace"] = log_exc.splitlines()[-1]
 
+    threads = []
     if en_sniff:
         from packetpulse.sensor.sensor import run_sniffer
         threads.append(threading.Thread(
-            target=_run, args=(run_sniffer, {"interface": iface}), daemon=True
-        ))
-    if en_url:
-        from packetpulse.urlscan.url_scanner import run_live_urlscan
-        threads.append(threading.Thread(
-            target=_run, args=(run_live_urlscan, {"interface": iface}), daemon=True
-        ))
+            target=_runner, name="pp-pipe-sniffer",
+            args=("sniffer", run_sniffer,
+                  {"interface": iface or None, "duration": duration,
+                   "save_pcap": True, "stop": stop}), daemon=False))
     if en_dns:
         from packetpulse.dns.dns_monitor import run_dns_monitor
         threads.append(threading.Thread(
-            target=_run, args=(run_dns_monitor, {"interface": iface, "duration": duration_secs}), daemon=True
-        ))
+            target=_runner, name="pp-pipe-dns",
+            args=("dns", run_dns_monitor,
+                  {"interface": iface or None, "duration": duration, "stop": stop}),
+            daemon=False))
+    if en_url:
+        from packetpulse.urlscan.url_scanner import run_live_urlscan
+        threads.append(threading.Thread(
+            target=_runner, name="pp-pipe-urlscan",
+            args=("urlscan", run_live_urlscan,
+                  {"interface": iface or None, "duration": duration, "stop": stop}),
+            daemon=False))
 
-    if not threads:
-        console.print("  [yellow]No modules selected.[/yellow]")
-        return
+    console.print(f"\n  [bold green]Pipeline running[/bold green]  "
+                  f"[dim]{len(threads)} modules for {_fmt_duration(duration)}[/dim]")
+    console.print("  [dim]Press Ctrl+C to stop everything early.[/dim]\n")
 
     for t in threads:
         t.start()
 
-    active = ([" [green]Sniffer[/green]"    if en_sniff else ""] +
-              [" [green]URLScan[/green]"    if en_url   else ""] +
-              [" [green]DNS Monitor[/green]"if en_dns   else ""])
-    console.print(
-        f"\n  [bold green]Pipeline running:[/bold green]"
-        + "  ".join(active)
-        + (f"\n  [dim]Duration:[/dim] [yellow]{dur_label}[/yellow]" if duration_secs else "\n  [dim]Press Ctrl+C to stop all modules.[/dim]")
-    )
-    console.print()
-
     try:
-        if duration_secs:
-            time.sleep(duration_secs)
-        else:
-            for t in threads:
-                t.join()
+        # Wait for the duration, but wake early if the user interrupts.
+        stop.wait(duration + 2)
     except KeyboardInterrupt:
-        pass
+        console.print("\n  [yellow]Stopping all modules...[/yellow]")
+    finally:
+        stop.stop()
 
-    console.print(f"\n  [green]Pipeline stopped.[/green]  Duration: {dur_label}")
-    if errors:
-        for e in errors:
-            console.print(f"  [yellow]Error: {e}[/yellow]")
+    console.print("\n  [dim]Signalled stop; waiting for modules to finish...[/dim]")
+    for t in threads:
+        t.join(timeout=90)
 
+    still_alive = [t.name for t in threads if t.is_alive()]
+    console.print()
+    console.print(_hr())
+    console.print("  [bold]PIPELINE RESULT[/bold]")
+    for name in ("sniffer", "dns", "urlscan"):
+        if name in results:
+            sess = results[name]
+            console.print(f"  [green]{name:9}[/green] {sess.summary_line()}")
+        elif name in failures:
+            console.print(f"  [red]{name:9} FAILED[/red] — {failures[name]}")
+    if still_alive:
+        console.print(f"  [red]Threads still running:[/red] {', '.join(still_alive)}")
+        console.print("  [red]Pipeline did NOT shut down cleanly.[/red]")
+    else:
+        console.print("  [dim]All module threads terminated; no background capture remains.[/dim]")
+    if failures:
+        console.print(f"  [yellow]{len([k for k in failures if not k.endswith('_trace')])} "
+                      f"module(s) failed; the pipeline did not complete in full.[/yellow]")
+    console.print(_hr())
     _press_enter()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _load_capture_engine():
+    """Import the capture engine, telling the user it may take a moment.
+
+    scapy's first import enumerates every adapter on the host. On machines with
+    many virtual adapters this has been measured at around two minutes, which
+    looks like a freeze if nothing is printed.
+    """
+    global _ENGINE_LOADED
+    if _ENGINE_LOADED:
+        return
+    console.print("  [dim]Loading capture engine (first use can take a minute "
+                  "on hosts with many network adapters)...[/dim]")
+    t0 = time.time()
+    import scapy.all  # noqa: F401
+    _ENGINE_LOADED = True
+    console.print(f"  [dim]Capture engine ready in {time.time() - t0:.1f}s.[/dim]\n")
+
+
+def _report_outcome(session) -> None:
+    """Print the honest outcome of a module run."""
+    if session is None:
+        return
+    d = session.to_dict()
+    colour = {"PASS": "green", "PARTIAL": "yellow", "FAIL": "red"}.get(d["status"], "white")
+    console.print()
+    console.print(_hr())
+    console.print(f"  [dim]Session   :[/dim] [cyan]{d['session_id']}[/cyan]")
+    console.print(f"  [dim]Status    :[/dim] [{colour}]{d['status']}[/{colour}]")
+    if d["requested_duration_seconds"]:
+        honored = d["duration_honored"]
+        console.print(
+            f"  [dim]Duration  :[/dim] requested {d['requested_duration_seconds']}s, "
+            f"measured {d['capture_duration_seconds']}s "
+            f"[{'green' if honored else 'yellow'}]"
+            f"({'honored' if honored else 'NOT honored'})[/]"
+        )
+    if d["counters"]:
+        console.print("  [dim]Observed  :[/dim] " +
+                      "  ".join(f"{k}={v}" for k, v in sorted(d["counters"].items())))
+    if d["unavailable_features"]:
+        console.print("  [yellow]Unavailable:[/yellow]")
+        for u in d["unavailable_features"]:
+            console.print(f"    [dim]- {u['feature']}: {u['reason']}[/dim]")
+    if d["errors"]:
+        console.print("  [red]Errors:[/red]")
+        for e in d["errors"]:
+            console.print(f"    [dim]- {e['where']}: {e['error'][:90]}[/dim]")
+    if d["abort_reason"]:
+        console.print(f"  [red]Aborted   :[/red] {d['abort_reason']}")
+    console.print(_hr())
+
 
 def _parse_duration(raw: str) -> int:
     """Parse '30s', '5m', '1h' → seconds. '0' or '' → 0 (unlimited)."""
@@ -736,32 +886,43 @@ def _press_enter() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    """Interactive menu loop.
 
+    No global SIGINT handler is installed: it converted Ctrl+C into SystemExit
+    in the main thread, overriding each module's own KeyboardInterrupt handling
+    and discarding the capture that had just been taken. Modules now handle the
+    interrupt themselves and finish cleanly; the loop catches whatever escapes.
+    """
     while True:
-        _print_banner()
-        _print_menu()
-        choice = _main_menu_prompt()
+        try:
+            _print_banner()
+            _print_menu()
+            choice = _main_menu_prompt()
 
-        if choice == "1":
-            _module_sniffer()
-        elif choice == "2":
-            _module_urlscan()
-        elif choice == "3":
-            _module_dns()
-        elif choice == "4":
-            _module_forensics()
-        elif choice == "5":
-            _module_pipeline()
-        elif choice == "0":
-            console.print("\n  [dim]Goodbye.[/dim]\n")
-            sys.exit(0)
-        else:
-            console.print(
-                f"\n  [yellow]'{choice}' is not a valid option.[/yellow]"
-                "  [dim]Enter a number from the menu.[/dim]"
-            )
-            time.sleep(1)
+            if choice == "1":
+                _module_sniffer()
+            elif choice == "2":
+                _module_urlscan()
+            elif choice == "3":
+                _module_dns()
+            elif choice == "4":
+                _module_forensics()
+            elif choice == "5":
+                _module_pipeline()
+            elif choice == "6":
+                _module_capabilities()
+            elif choice == "0":
+                console.print("\n  [dim]Goodbye.[/dim]\n")
+                return
+            else:
+                console.print(
+                    f"\n  [yellow]'{choice}' is not a valid option.[/yellow]"
+                    "  [dim]Enter a number from the menu.[/dim]"
+                )
+                time.sleep(1)
+        except KeyboardInterrupt:
+            console.print("\n  [yellow]Returning to the menu.[/yellow]")
+            time.sleep(0.6)
 
 
 if __name__ == "__main__":

@@ -5,29 +5,56 @@ Report: PacketPulse | Dreamwalker4u
 """
 from __future__ import annotations
 
-import os, re, socket, threading, time, json, queue
-from collections import defaultdict, Counter
+import json
+import re
+import threading
+import time
+import queue
+from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict, Counter, deque
 from datetime import datetime
 from pathlib import Path
 from textwrap import wrap
 from typing import Optional
 
 import psutil
-from rich.console import Console
-from rich import box
+from rich.markup import escape as rescape
 
+from packetpulse import __version__
 from packetpulse.core.config import get_config
-from packetpulse.core.logger import get_logger
+from packetpulse.core.logger import get_logger, console as _shared_console
+from packetpulse.core import capabilities
+from packetpulse.core.session import Session, StopController, utc_now
 from packetpulse.utils.helpers import (
     geoip_lookup, is_private_ip, reverse_dns,
-    human_bytes, truncate, save_json, save_ndjson, ensure_dir, now_str, timestamp_filename
+    human_bytes, truncate, save_json, ensure_dir, timestamp_filename,
+    h as esc, UNKNOWN,
 )
 
+# Narrow scapy imports. `from scapy.all import ...` loads every contrib module
+# and measured ~123 s on a Windows host with 79 network adapters; importing the
+# layers actually used takes ~4 s and leaves conf.ifaces fully populated, so
+# capture, BPF filters, decoding and PCAP writing behave identically.
+from packetpulse.core import scapy_compat
+from packetpulse.core.scapy_compat import prepare_scapy, IMPORT_ERROR as _SCAPY_ERR
+
+# Must run before any scapy layer import: on some kernels scapy 2.6+
+# raises KeyError: 'scope' while building its IPv6 route table.
+prepare_scapy()
+
 try:
-    from scapy.all import sniff, IP, IPv6, TCP, UDP, ICMP, DNS, Raw, Ether, ARP, wrpcap
+    from scapy.layers.l2 import ARP, Ether
+    from scapy.layers.inet import ICMP, IP, TCP, UDP
+    from scapy.layers.inet6 import IPv6
+    from scapy.layers.dns import DNS
+    from scapy.packet import Raw
+    from scapy.sendrecv import sniff
+    from scapy.utils import PcapReader, PcapWriter
     SCAPY_OK = True
-except ImportError:
+    SCAPY_UNAVAILABLE_REASON = ""
+except Exception as _e:
     SCAPY_OK = False
+    SCAPY_UNAVAILABLE_REASON = _SCAPY_ERR or "{}: {}".format(type(_e).__name__, _e)
 
 try:
     from reportlab.lib.pagesizes import letter
@@ -36,16 +63,17 @@ try:
 except ImportError:
     PDF_OK = False
 
-console = Console()
+console = _shared_console
 log = get_logger("sensor")
 
 # ── Session globals ───────────────────────────────────────────────────────────
-_stats = {"total":0,"tcp":0,"udp":0,"icmp":0,"arp":0,"other":0,
-          "bytes":0,"http":0,"dns":0,"start":datetime.utcnow()}
+_stats = {"total": 0, "tcp": 0, "udp": 0, "icmp": 0, "arp": 0, "other": 0,
+          "bytes": 0, "http": 0, "dns": 0, "start": utc_now()}
 _geo_cache:   dict[str, dict] = {}
 _dns_cache:   dict[str, str]  = {}
-_captured_packets = []
-_packet_log:   list[dict] = []
+_packet_log: deque = deque(maxlen=50000)
+_pcap_writer = None          # scapy PcapWriter; complete, streamed to disk
+_ndjson_fh = None            # complete per-packet record stream
 _connections:  dict[str, dict] = {}
 _domains_seen: set[str] = set()
 _ips_seen:     dict[str, dict] = {}
@@ -56,15 +84,106 @@ _packet_queue: Optional[queue.Queue] = None
 _worker_thread: Optional[threading.Thread] = None
 _conn_cache: list = []
 _conn_cache_timestamp: float = 0.0
+_attribution_blocked: dict = {"reason": ""}
+_draining = False
 _stop_sniffing = False
 _sniff_start_time: Optional[float] = None
 _sniff_duration: int = 0
 
 
+# ── Endpoint enrichment ──────────────────────────────────────────────────────
+#
+# GeoIP and reverse DNS are NETWORK operations. Performing them inline in the
+# packet path made a short capture take minutes: every new public address
+# triggered an HTTP lookup plus a PTR query, serially, while packets queued
+# behind it.
+#
+# They now run on a small bounded pool. The packet record captures whatever is
+# already known; the report is written after the pool drains, so results that
+# arrive late are still included. Anything unresolved is reported as such
+# rather than guessed.
+
+_ENRICH_WORKERS = 4
+_ENRICH_MAX_ADDRESSES = 500        # hard ceiling per session
+_enrich_pool: Optional[ThreadPoolExecutor] = None
+_enrich_requested: set[str] = set()
+_enrich_lock = threading.Lock()
+
+
+def _enrich_start() -> None:
+    global _enrich_pool
+    _enrich_requested.clear()
+    _enrich_pool = ThreadPoolExecutor(
+        max_workers=_ENRICH_WORKERS, thread_name_prefix="pp-enrich"
+    )
+    # Enrichment is best-effort metadata. Its threads must not keep the process
+    # alive or delay a return to the menu, so they are marked daemon after
+    # creation; unfinished lookups are reported as unresolved rather than waited on.
+    for t in threading.enumerate():
+        if t.name.startswith("pp-enrich"):
+            t.daemon = True
+
+
+def _enrich_pending_count() -> int:
+    with _enrich_lock:
+        return max(len(_enrich_requested) - len(_geo_cache), 0)
+
+
+def _enrich_shutdown(timeout: float = 8.0) -> int:
+    """Drain outstanding enrichment work. Returns the count left UNRESOLVED."""
+    global _enrich_pool
+    pool, _enrich_pool = _enrich_pool, None
+    if pool is None:
+        return 0
+    # Bounded: cancel work that has not started rather than let shutdown hang.
+    deadline = time.monotonic() + timeout
+    pool.shutdown(wait=False, cancel_futures=True)
+    while time.monotonic() < deadline:
+        if not any(t.is_alive() for t in threading.enumerate()
+                   if t.name.startswith("pp-enrich")):
+            break
+        time.sleep(0.1)
+    return _enrich_pending_count()
+
+
+def _enrich_endpoint(ip: str) -> None:
+    """Resolve one address off the packet path."""
+    threading.current_thread().daemon = True
+    try:
+        cfg = get_config().sensor
+        _geo_cache[ip] = geoip_lookup(ip, cfg.geoip_db, allow_online=cfg.geoip_online)
+    except (OSError, ValueError) as e:
+        log.warning("geoip lookup failed for %s: %s", ip, e)
+        _geo_cache[ip] = {"country": "UNAVAILABLE", "city": "UNAVAILABLE",
+                          "org": "", "source": "none", "available": False}
+    try:
+        _dns_cache[ip] = reverse_dns(ip)
+    except OSError:
+        _dns_cache[ip] = ""
+
+
+def _request_enrichment(ip: str) -> None:
+    """Queue an address for background enrichment, once, up to the ceiling."""
+    if not ip or _enrich_pool is None:
+        return
+    with _enrich_lock:
+        if ip in _enrich_requested or len(_enrich_requested) >= _ENRICH_MAX_ADDRESSES:
+            return
+        _enrich_requested.add(ip)
+    try:
+        _enrich_pool.submit(_enrich_endpoint, ip)
+    except RuntimeError:
+        # Pool already shutting down; not an error worth failing the capture for.
+        pass
+
+
 def _geo(ip: str) -> dict:
-    if ip not in _geo_cache:
-        _geo_cache[ip] = geoip_lookup(ip, get_config().sensor.geoip_db)
-    return _geo_cache[ip]
+    """Return what is currently known about an address. Never blocks."""
+    if ip in _geo_cache:
+        return _geo_cache[ip]
+    _request_enrichment(ip)
+    return {"country": "PENDING", "city": "PENDING", "lat": 0.0, "lon": 0.0,
+            "org": "", "source": "pending", "available": False}
 
 
 def _refresh_connection_cache() -> None:
@@ -73,51 +192,101 @@ def _refresh_connection_cache() -> None:
     if now - _conn_cache_timestamp > 2.0:
         try:
             _conn_cache = psutil.net_connections(kind="inet")
-        except Exception:
+        except (psutil.AccessDenied, PermissionError) as e:
+            # Without privilege the OS hides other users' sockets. Attribution
+            # then legitimately cannot be established for most packets.
             _conn_cache = []
+            _attribution_blocked["reason"] = f"{type(e).__name__}: insufficient privilege to enumerate sockets"
+        except OSError as e:
+            _conn_cache = []
+            _attribution_blocked["reason"] = f"{type(e).__name__}: {e}"
         _conn_cache_timestamp = now
 
 
-def _find_process(sp: int, dp: int, src_ip: str = "", dst_ip: str = "") -> str:
+def _find_process(sp: int, dp: int, src_ip: str = "", dst_ip: str = "") -> dict:
+    """Attribute a packet to a local process by exact socket four-tuple.
+
+    Returns {"process": str, "attribution": "EXACT"|"INFERRED"|"UNKNOWN",
+             "reason": str}.
+
+    Only an exact match on (local ip, local port, remote ip, remote port) is
+    reported as confirmed. A previous implementation fell back to the first
+    connection sharing EITHER port, which meant any HTTPS packet could be
+    attributed to an unrelated process that merely also talked to port 443.
+    A wrong process name is worse than UNKNOWN, so the fallback is now
+    reported as INFERRED with its basis, or not at all.
+    """
+    unknown = {"process": "", "attribution": "UNKNOWN", "reason": "no matching socket"}
+    if not (src_ip and dst_ip):
+        return {"process": "", "attribution": "UNKNOWN",
+                "reason": "packet lacks addresses for socket matching"}
+
     _refresh_connection_cache()
-    ports = {sp, dp}
-    best_conn = None
+    exact = None
+    same_local_port = []
+
     for c in _conn_cache:
         if not c.laddr:
             continue
         try:
-            l_ip, l_port = c.laddr
-        except Exception:
+            l_ip, l_port = c.laddr.ip, c.laddr.port
+        except AttributeError:
             continue
-        r_ip, r_port = ("", "")
+        r_ip, r_port = "", 0
         if c.raddr:
             try:
-                r_ip, r_port = c.raddr
-            except Exception:
-                pass
-        if l_port not in ports and r_port not in ports:
-            continue
+                r_ip, r_port = c.raddr.ip, c.raddr.port
+            except AttributeError:
+                r_ip, r_port = "", 0
 
-        exact_local = (src_ip and dst_ip and l_ip == src_ip and r_ip == dst_ip and l_port == sp and r_port == dp)
-        exact_remote = (src_ip and dst_ip and l_ip == dst_ip and r_ip == src_ip and l_port == dp and r_port == sp)
-        if exact_local or exact_remote:
-            best_conn = c
+        # Outbound: local socket is the packet source.
+        if l_ip == src_ip and l_port == sp and r_ip == dst_ip and r_port == dp:
+            exact = c
             break
-        if best_conn is None:
-            best_conn = c
+        # Inbound: local socket is the packet destination.
+        if l_ip == dst_ip and l_port == dp and r_ip == src_ip and r_port == sp:
+            exact = c
+            break
+        # Candidate for clearly-labelled inference: our own listening/ephemeral
+        # port on the matching address, remote side not yet established.
+        if (l_ip == src_ip and l_port == sp) or (l_ip == dst_ip and l_port == dp):
+            same_local_port.append(c)
 
-    if best_conn and best_conn.pid:
-        try:
-            proc = psutil.Process(best_conn.pid)
-            proc_name = proc.name()
-            return f"{proc_name}({best_conn.pid})"
-        except Exception:
-            return f"pid:{best_conn.pid}"
-    return ""
+    if exact is not None:
+        name = _proc_name(exact.pid)
+        if name:
+            return {"process": name, "attribution": "EXACT",
+                    "reason": "exact socket four-tuple match"}
+        return {"process": f"pid:{exact.pid}" if exact.pid else "",
+                "attribution": "EXACT" if exact.pid else "UNKNOWN",
+                "reason": "socket matched but process name unavailable"}
+
+    # Exactly one candidate on our own local endpoint is a defensible
+    # inference. More than one is ambiguous, so we say UNKNOWN.
+    if len(same_local_port) == 1:
+        c = same_local_port[0]
+        name = _proc_name(c.pid)
+        if name:
+            return {"process": name, "attribution": "INFERRED",
+                    "reason": "unique local endpoint match; remote peer not confirmed"}
+
+    return unknown
+
+
+def _proc_name(pid) -> str:
+    if not pid:
+        return ""
+    try:
+        proc = psutil.Process(pid)
+        return f"{proc.name()}({pid})"
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return ""
+
 
 def _parse_http(payload: bytes) -> Optional[dict]:
     try: text = payload.decode("utf-8", errors="replace")
-    except: return None
+    except Exception:
+        return None
     req = re.match(r"(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|CONNECT)\s+(\S+)\s+(HTTP/[\d.]+)\r?\n(.+?)(?:\r?\n\r?\n|$)", text, re.DOTALL)
     if req:
         headers = {}
@@ -142,34 +311,70 @@ def _parse_http(payload: bytes) -> Optional[dict]:
                 "server":headers.get("Server",""),"set_cookie":headers.get("Set-Cookie","")}
     return None
 
+def _dns_first(record):
+    """First entry of a DNS section, across scapy versions.
+
+    scapy >= 2.6 exposes qd/an/ns/ar as PacketListField, where attribute access
+    is deprecated and raises IndexError when the section is empty. Older scapy
+    returns the record directly.
+    """
+    if record is None:
+        return None
+    if isinstance(record, (list, tuple)):
+        return record[0] if record else None
+    try:
+        return record[0]
+    except (IndexError, TypeError, KeyError):
+        return record
+
+
+def _dns_section(record):
+    """All entries of a DNS section as a list."""
+    if record is None:
+        return []
+    if isinstance(record, (list, tuple)):
+        return list(record)
+    try:
+        return [record[i] for i in range(len(record))]
+    except (TypeError, IndexError, KeyError):
+        return [record]
+
+
 def _parse_dns_pkt(pkt) -> Optional[dict]:
     if not pkt.haslayer(DNS):
         return None
     dns = pkt[DNS]
+
+    def _count(value) -> int:
+        """Record counts may be absent on malformed packets; treat as zero."""
+        try:
+            return int(value) if value is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    qd_n, an_n = _count(dns.qdcount), _count(dns.ancount)
     r: dict = {
         "type": "QUERY" if dns.qr == 0 else "RESPONSE",
-        "rcode": dns.rcode,
-        "qdcount": dns.qdcount,
-        "ancount": dns.ancount,
-        "nscount": dns.nscount,
-        "arcount": dns.arcount,
+        "rcode": _count(dns.rcode),
+        "qdcount": qd_n,
+        "ancount": an_n,
+        "nscount": _count(dns.nscount),
+        "arcount": _count(dns.arcount),
     }
     qmap = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV", 41: "OPT", 255: "ANY"}
 
-    if dns.qdcount > 0:
+    q = _dns_first(getattr(dns, "qd", None))
+    if q is not None:
         try:
-            q = dns.qd
             r["query"] = q.qname.decode("utf-8", errors="replace").rstrip(".")
             r["qtype"] = qmap.get(q.qtype, str(q.qtype))
             r["qclass"] = q.qclass
         except Exception:
             pass
 
-    if dns.qr == 1 and dns.ancount > 0:
+    if dns.qr == 1:
         answers = []
-        rr = dns.an
-        seen = 0
-        while rr and seen < dns.ancount:
+        for rr in _dns_section(getattr(dns, "an", None)):
             if hasattr(rr, "rdata"):
                 try:
                     name = getattr(rr, "rrname", b"").decode("utf-8", errors="replace").rstrip(".")
@@ -186,8 +391,6 @@ def _parse_dns_pkt(pkt) -> Optional[dict]:
                     "ttl": getattr(rr, "ttl", None),
                     "data": answer_text,
                 })
-                seen += 1
-            rr = rr.payload if hasattr(rr, "payload") and rr.payload else None
         r["answers"] = answers
     return r
 
@@ -195,181 +398,248 @@ def _tcp_flags(f) -> str:
     return " ".join(n for c,n in [("F","FIN"),("S","SYN"),("R","RST"),("P","PSH"),("A","ACK"),("U","URG")] if c in str(f)) or str(f)
 
 
-def _infer_activity(info: dict) -> Optional[dict]:
-    """Infer likely user/system action represented by a packet."""
+# ── Evidence-based classification ────────────────────────────────────────────
+#
+# Every observation below is derived from fields actually present in the packet.
+# There are no fixed confidence percentages: a score is the sum of the weights
+# of the indicators that genuinely fired, and each indicator carries the basis
+# on which it fired so a reader can check the reasoning.
+#
+# Weights (documented, deterministic):
+#   40  known-dangerous service exposed to a public peer
+#   30  cleartext credential-bearing request
+#   25  administrative interface access
+#   20  remote-access protocol
+#   15  cleartext protocol carrying data
+#   10  protocol anomaly / unusual structure
+#    5  routine egress to a public address
+#
+# Score -> signal:  >=50 STRONG,  >=25 MODERATE,  >0 WEAK,  0 NONE
+# "Signal" describes how much evidence was observed. It is NOT a probability
+# and is never presented as one.
+
+_SIGNAL_STRONG = "STRONG"
+_SIGNAL_MODERATE = "MODERATE"
+_SIGNAL_WEAK = "WEAK"
+_SIGNAL_NONE = "NONE"
+
+_SERVICE_PORTS = {
+    20: ("FTP data", 15, "cleartext"),
+    21: ("FTP control", 15, "cleartext"),
+    22: ("SSH", 20, "remote-access"),
+    23: ("Telnet", 30, "cleartext-remote-access"),
+    25: ("SMTP", 15, "mail"),
+    53: ("DNS", 0, "infrastructure"),
+    80: ("HTTP", 15, "cleartext"),
+    110: ("POP3", 15, "cleartext"),
+    143: ("IMAP", 15, "cleartext"),
+    443: ("HTTPS/TLS", 0, "encrypted"),
+    445: ("SMB", 25, "file-sharing"),
+    1433: ("MSSQL", 20, "database"),
+    3306: ("MySQL", 20, "database"),
+    3389: ("RDP", 20, "remote-access"),
+    5432: ("PostgreSQL", 20, "database"),
+    5900: ("VNC", 20, "remote-access"),
+    8080: ("HTTP-alt", 15, "cleartext"),
+}
+
+
+def _signal_for(score: int) -> str:
+    if score >= 50:
+        return _SIGNAL_STRONG
+    if score >= 25:
+        return _SIGNAL_MODERATE
+    if score > 0:
+        return _SIGNAL_WEAK
+    return _SIGNAL_NONE
+
+
+def _infer_activity(info: dict) -> dict:
+    """Classify a packet from observed fields only.
+
+    Returns a dict containing the observation, the evidence list that produced
+    it, a deterministic score, and a signal level. Language is deliberately
+    hedged: this function reports what was *observed*, and labels anything
+    beyond that as a heuristic indication.
+    """
     proto = info.get("proto", "")
-    sp = int(info.get("src_port") or 0)
-    dp = int(info.get("dst_port") or 0)
-    ports = {sp, dp}
+    try:
+        sp = int(info.get("src_port") or 0)
+        dp = int(info.get("dst_port") or 0)
+    except (TypeError, ValueError):
+        sp = dp = 0
+    ports = {p for p in (sp, dp) if p}
+
     remote = info.get("dst_ip", "")
-    private_dst = is_private_ip(remote) if remote else True
+    remote_is_public = bool(remote) and not is_private_ip(remote)
 
-    risk = "LOW"
-    confidence = 55
-    action = "Generic network traffic"
-    reason = "No strong signature"
-    tags: list[str] = []
+    evidence: list[dict] = []
+    score = 0
 
+    def add(indicator: str, weight: int, basis: str) -> None:
+        nonlocal score
+        evidence.append({"indicator": indicator, "weight": weight, "basis": basis})
+        score = min(100, score + weight)
+
+    observation = f"{proto or 'Unknown protocol'} packet observed"
+    encrypted_note = ""
+
+    # ── Service identification from port numbers ─────────────────────────────
+    service = ""
+    for port in sorted(ports):
+        if port in _SERVICE_PORTS:
+            name, weight, kind = _SERVICE_PORTS[port]
+            service = name
+            observation = f"{name} traffic observed"
+            if weight:
+                scope = "public peer" if remote_is_public else "local peer"
+                add(f"{name} service port", weight if remote_is_public else max(weight - 10, 5),
+                    f"port {port} ({kind}) with {scope}")
+            if kind == "encrypted":
+                encrypted_note = (
+                    "Payload is TLS-encrypted; contents were not decrypted. "
+                    "Only endpoint metadata is available."
+                )
+            break
+
+    # ── DNS: structural observations only ────────────────────────────────────
     if proto == "DNS":
         d = info.get("dns") or {}
-        q = (d.get("query") or "").lower()
-        action = "Domain name resolution"
-        reason = "DNS query/response observed"
-        confidence = 82
-        tags = ["dns", "resolution"]
-        if len(q) > 45 or q.count(".") >= 5:
-            risk = "MEDIUM"
-            action = "Possible DNS tunneling / beaconing"
-            reason = "Very long or deeply nested domain"
-            confidence = 72
-            tags.append("possible-c2")
-        elif d.get("rcode") == 3:
-            risk = "MEDIUM"
-            action = "Failed domain lookup (NXDOMAIN)"
-            reason = "Could indicate typo, DGA, or blocked domain"
-            confidence = 70
-            tags.append("nxdomain")
+        qname = (d.get("query") or "").lower()
+        observation = "DNS query observed" if d.get("type") == "QUERY" else "DNS response observed"
+        if qname:
+            labels = qname.split(".")
+            if len(qname) > 60:
+                add("Long DNS name", 10, f"query name is {len(qname)} characters")
+            if len(labels) >= 6:
+                add("Deeply nested DNS name", 10, f"{len(labels)} labels in query name")
+            longest = max((len(l) for l in labels), default=0)
+            if longest >= 40:
+                add("Long single DNS label", 10, f"longest label is {longest} characters")
+        if d.get("rcode") == 3:
+            add("NXDOMAIN response", 10, "server reported the name does not exist")
+            observation = "DNS lookup failed (NXDOMAIN)"
 
+    # ── HTTP: only ever from genuinely plaintext traffic ─────────────────────
     elif proto == "HTTP":
-        h = info.get("http") or {}
-        method = (h.get("method") or "").upper()
-        host = (h.get("host") or "").lower()
-        path = (h.get("path") or "").lower()
-        action = "Web browsing/API request"
-        reason = "HTTP method and host/path visible"
-        confidence = 88
-        tags = ["http", "web"]
+        hh = info.get("http") or {}
+        method = (hh.get("method") or "").upper()
+        path = (hh.get("path") or "").lower()
+        host = (hh.get("host") or "").lower()
+        if method:
+            observation = f"Cleartext HTTP {method} request observed"
+        else:
+            observation = "Cleartext HTTP response observed"
+        add("Cleartext HTTP", 15, "request/response readable on the wire")
 
         auth_terms = ("login", "signin", "auth", "token", "oauth", "password", "session")
-        admin_terms = ("admin", "wp-admin", "dashboard", "panel")
-        file_terms = ("upload", "download", "export", "backup", "dump", "archive", "zip")
+        admin_terms = ("admin", "wp-admin", "dashboard", "manager", "phpmyadmin")
+        matched_auth = [t for t in auth_terms if t in path]
+        matched_admin = [t for t in admin_terms if t in path]
 
-        if method == "POST" and any(t in path for t in auth_terms):
-            action = "Credential submission / authentication"
-            reason = "POST to auth-like endpoint"
-            confidence = 93
-            risk = "MEDIUM"
-            tags += ["auth", "credentials"]
-        elif any(t in path for t in admin_terms):
-            action = "Admin portal access"
-            reason = "Admin-like URL path"
-            confidence = 86
-            risk = "MEDIUM"
-            tags += ["admin"]
-        elif any(t in path for t in file_terms):
-            action = "File transfer operation"
-            reason = "Upload/download/export-like endpoint"
-            confidence = 82
-            risk = "MEDIUM"
-            tags += ["file-transfer"]
-        if any(x in host for x in ("paste", "anon", "temp", "share", "drop")):
-            risk = "MEDIUM" if risk == "LOW" else "HIGH"
-            tags.append("external-share")
-
-    elif proto == "TCP":
-        tags = ["tcp"]
-        if 443 in ports:
-            action = "Encrypted web session (HTTPS/TLS)"
-            reason = "Traffic to/from port 443"
-            confidence = 80
-            tags += ["https", "encrypted"]
-        elif 22 in ports:
-            action = "Remote shell session (SSH)"
-            reason = "Traffic to/from port 22"
-            confidence = 92
-            risk = "MEDIUM"
-            tags += ["ssh", "remote-access"]
-        elif 3389 in ports:
-            action = "Remote desktop session (RDP)"
-            reason = "Traffic to/from port 3389"
-            confidence = 94
-            risk = "HIGH"
-            tags += ["rdp", "remote-access"]
-        elif 445 in ports:
-            action = "SMB file share activity"
-            reason = "Traffic to/from port 445"
-            confidence = 90
-            risk = "HIGH" if not private_dst else "MEDIUM"
-            tags += ["smb", "lateral-movement"]
-        elif 21 in ports or 20 in ports:
-            action = "FTP file transfer"
-            reason = "Traffic to/from FTP ports"
-            confidence = 90
-            risk = "HIGH"
-            tags += ["ftp", "cleartext"]
-        elif 25 in ports or 587 in ports or 465 in ports:
-            action = "Email transport activity (SMTP)"
-            reason = "Traffic to/from SMTP ports"
-            confidence = 86
-            risk = "MEDIUM"
-            tags += ["smtp", "mail"]
-        elif 1433 in ports or 3306 in ports or 5432 in ports:
-            action = "Database connectivity"
-            reason = "Traffic to common DB service port"
-            confidence = 84
-            risk = "MEDIUM" if private_dst else "HIGH"
-            tags += ["database"]
-        else:
-            action = "General TCP session"
-            reason = "TCP stream without recognized service port"
-            confidence = 60
-
-    elif proto == "UDP":
-        tags = ["udp"]
-        if 53 in ports:
-            action = "DNS transport"
-            reason = "UDP/53 observed"
-            confidence = 84
-            tags += ["dns"]
-        elif 123 in ports:
-            action = "Time synchronization (NTP)"
-            reason = "UDP/123 observed"
-            confidence = 90
-            tags += ["ntp"]
-        elif 67 in ports or 68 in ports:
-            action = "DHCP lease negotiation"
-            reason = "UDP/67-68 observed"
-            confidence = 90
-            tags += ["dhcp"]
-        else:
-            action = "General UDP datagram exchange"
-            reason = "UDP without known service port"
-            confidence = 58
+        if method == "POST" and matched_auth:
+            add("Credential-bearing POST over cleartext", 30,
+                f"POST to path containing {matched_auth[0]!r}")
+            observation = "Potential credential submission over cleartext HTTP"
+        elif matched_auth:
+            add("Authentication-related path", 10,
+                f"path contains {matched_auth[0]!r}")
+        if matched_admin:
+            add("Administrative interface path", 25,
+                f"path contains {matched_admin[0]!r}")
+            observation = "Administrative interface access observed"
+        if host and remote_is_public:
+            add("External web request", 5, f"Host header {host!r} on a public peer")
 
     elif proto == "ICMP":
-        action = "Network reachability / diagnostics"
-        reason = "ICMP packet observed (ping/traceroute behavior)"
-        confidence = 85
-        tags = ["icmp", "diagnostics"]
+        observation = "ICMP message observed"
 
-    if not private_dst and risk == "LOW" and proto in ("TCP", "UDP", "HTTP"):
-        risk = "MEDIUM"
-        tags.append("internet-egress")
+    elif proto == "ARP":
+        observation = "ARP exchange observed on local segment"
 
-    return {
-        "activity": action,
-        "risk": risk,
-        "confidence": confidence,
-        "reason": reason,
-        "tags": tags,
+    # ── Generic egress ───────────────────────────────────────────────────────
+    if remote_is_public and proto in ("TCP", "UDP", "HTTP", "DNS") and not evidence:
+        add("Egress to public address", 5, f"destination {remote} is globally routable")
+
+    signal = _signal_for(score)
+    result = {
+        "observation": observation,
+        "signal": signal,
+        "score": score,
+        "evidence": evidence,
+        "service": service or None,
     }
+    if encrypted_note:
+        result["encryption_note"] = encrypted_note
+    if not evidence:
+        result["evidence_note"] = "No scored indicators; routine traffic."
+    return result
+
+
+def _attribution_fields(attr: dict) -> dict:
+    """Flatten process attribution into packet fields, preserving the label."""
+    return {
+        "process": attr.get("process", ""),
+        "process_attribution": attr.get("attribution", "UNKNOWN"),
+        "process_basis": attr.get("reason", ""),
+    }
+
+
+def _record_finding(info: dict, src_ip: str, dst_ip: str) -> None:
+    """Record a scored observation. Only indicators that actually fired qualify."""
+    intel = info.get("intel") or {}
+    if intel.get("signal") in ("STRONG", "MODERATE"):
+        _investigation_hits.append({
+            "time": info.get("timestamp", ""),
+            "src": src_ip or "UNKNOWN",
+            "dst": dst_ip or "UNKNOWN",
+            "proto": info.get("proto", ""),
+            "observation": intel.get("observation", ""),
+            "signal": intel.get("signal", ""),
+            "score": intel.get("score", 0),
+            "evidence": intel.get("evidence", []),
+        })
+
 
 def _should_stop(pkt) -> bool:
     if _stop_sniffing: return True
     if _sniff_duration>0 and _sniff_start_time and time.time()-_sniff_start_time>=_sniff_duration: return True
     return False
 
+def _render_process(info: dict) -> str:
+    """Show attribution honestly: confirmed, inferred, or unknown."""
+    attr = info.get("process_attribution", "UNKNOWN")
+    name = info.get("process", "")
+    if attr == "EXACT" and name:
+        return f"  [dim italic]{rescape(name)}[/dim italic]"
+    if attr == "INFERRED" and name:
+        return f"  [dim italic]{rescape(name)}[/dim italic] [yellow](INFERRED)[/yellow]"
+    return "  [dim italic]proc:UNKNOWN[/dim italic]"
+
+
+def _log_packet(info: dict) -> None:
+    """Record a packet: complete to NDJSON on disk, bounded in memory."""
+    _packet_log.append(dict(info))
+    if _ndjson_fh is not None:
+        try:
+            _ndjson_fh.write(json.dumps(info, default=str) + "\n")
+        except (OSError, TypeError, ValueError) as e:
+            log.warning("NDJSON write failed: %s: %s", type(e).__name__, e)
+
+
 def _render(info: dict) -> None:
+    if _draining:
+        return
     p   = info.get("proto","?"); src=info.get("src_ip","?"); dst=info.get("dst_ip","?")
     sp  = info.get("src_port",""); dp=info.get("dst_port",""); ts=info.get("timestamp","")
-    geo = info.get("geo",{}); proc=info.get("process",""); size=info.get("size",0)
+    geo = info.get("geo",{}); size=info.get("size",0)
     cm  = {"TCP":"cyan","UDP":"yellow","ICMP":"green","DNS":"magenta","ARP":"blue","HTTP":"bright_green"}
     c   = cm.get(p,"white")
     lines=[
         f"[dim]{ts}[/dim]  [{c}]{p}[/{c}]  [bold white]{src}[/bold white]"
         f"{':[yellow]'+str(sp)+'[/yellow]' if sp else ''}  [dim]→[/dim]  "
         f"[bold white]{dst}[/bold white]{':[green]'+str(dp)+'[/green]' if dp else ''}  [dim]{size}B[/dim]"
-        + (f"  [dim italic]{proc}[/dim italic]" if proc else "")
+        + _render_process(info)
     ]
     if info.get("mac_src"): lines.append(f"  [dim]L2  MAC[/dim]  {info['mac_src']} [dim]→[/dim] {info['mac_dst']}")
     if info.get("ttl"):     lines.append(f"  [dim]L3  IP[/dim]   TTL={info['ttl']}")
@@ -382,13 +652,13 @@ def _render(info: dict) -> None:
     if country and country not in("Unknown","LAN"):
         city=geo.get("city",""); org=geo.get("org","")
         lines.append(f"  [dim]GEO      [/dim]  [cyan]{country}[/cyan]"+(f", {city}" if city and city!="Unknown" else "")+(f"  [dim]{org}[/dim]" if org else ""))
-    if info.get("rdns"): lines.append(f"  [dim]rDNS     [/dim]  [dim]{info['rdns']}[/dim]")
+    if info.get("rdns"): lines.append(f"  [dim]rDNS     [/dim]  [dim]{rescape(str(info['rdns']))}[/dim]")
     h=info.get("http")
     if h:
         if h.get("type")=="REQUEST":
-            lines.append(f"  [dim]HTTP     [/dim]  [bright_green]{h['method']}[/bright_green] [white]{h.get('host','')}{h.get('path','')}[/white]")
-            if h.get("user_agent"): lines.append(f"  [dim]  User-Agent[/dim]  {truncate(h['user_agent'],60)}")
-            if h.get("referer"):    lines.append(f"  [dim]  Referer  [/dim]  {h['referer']}")
+            lines.append(f"  [dim]HTTP     [/dim]  [bright_green]{rescape(str(h['method']))}[/bright_green] [white]{rescape(str(h.get('host','')) + str(h.get('path','')))}[/white]")
+            if h.get("user_agent"): lines.append(f"  [dim]  User-Agent[/dim]  {rescape(truncate(str(h['user_agent']),60))}")
+            if h.get("referer"):    lines.append(f"  [dim]  Referer  [/dim]  {rescape(str(h['referer']))}")
             if h.get("body"):       lines.append(f"  [dim]  Body     [/dim]  [yellow]{truncate(h['body'],120)}[/yellow]")
         elif h.get("type")=="RESPONSE":
             sc=h.get("status_code",""); sc_col="green" if sc.startswith("2") else "yellow" if sc.startswith("3") else "red"
@@ -397,7 +667,7 @@ def _render(info: dict) -> None:
     di=info.get("dns")
     if di:
         if di.get("type")=="QUERY":
-            lines.append(f"  [dim]DNS      [/dim]  [magenta]? {di.get('query','')}[/magenta]  [dim]{di.get('qtype','')}[/dim]")
+            lines.append(f"  [dim]DNS      [/dim]  [magenta]? {rescape(str(di.get('query','')))}[/magenta]  [dim]{rescape(str(di.get('qtype','')))}[/dim]")
         elif di.get("type")=="RESPONSE":
             ans=di.get("answers",[])
             if di.get("rcode")==3:
@@ -415,14 +685,20 @@ def _render(info: dict) -> None:
                 )
     intel = info.get("intel")
     if intel:
-        rc = {"LOW": "green", "MEDIUM": "yellow", "HIGH": "red"}.get(intel.get("risk", "LOW"), "white")
+        sig = intel.get("signal", "NONE")
+        sc = {"STRONG": "red", "MODERATE": "yellow", "WEAK": "cyan"}.get(sig, "dim")
         lines.append(
-            f"  [dim]INTEL    [/dim]  [bold]{intel.get('activity','')}[/bold]"
-            f"  [{rc}]risk={intel.get('risk','LOW')}[/{rc}]"
-            f"  [dim]conf={intel.get('confidence',0)}%[/dim]"
+            f"  [dim]OBSERVED [/dim]  [bold]{rescape(str(intel.get('observation','')))}[/bold]"
+            f"  [{sc}]signal={sig}[/{sc}]"
+            f"  [dim]score={intel.get('score',0)}/100[/dim]"
         )
-        if intel.get("reason"):
-            lines.append(f"  [dim]  Why    [/dim]  [dim]{intel.get('reason')}[/dim]")
+        for ev in intel.get("evidence", [])[:3]:
+            lines.append(
+                f"  [dim]  +{ev.get('weight',0):<3}[/dim]  [dim]{rescape(str(ev.get('indicator','')))}"
+                f" — {rescape(str(ev.get('basis','')))}[/dim]"
+            )
+        if intel.get("encryption_note"):
+            lines.append(f"  [dim]  NOTE   [/dim]  [dim]{rescape(intel['encryption_note'])}[/dim]")
     console.print("\n".join(lines))
     console.print("[dim]"+"─"*100+"[/dim]")
 
@@ -432,12 +708,10 @@ def _process_packet(pkt) -> None:
     with _lock:
         _stats["total"] += 1
         _stats["bytes"] += len(pkt)
-        _captured_packets.append(pkt)
-        if len(_captured_packets) > 8000:
-            _captured_packets[:] = _captured_packets[-8000:]
 
     info: dict = {
-        "timestamp": datetime.utcnow().strftime("%H:%M:%S.%f")[:-3],
+        "timestamp": utc_now().strftime("%H:%M:%S.%f")[:-3],
+        "ts_epoch": time.time(),
         "size": len(pkt),
         "proto": "OTHER",
     }
@@ -450,7 +724,7 @@ def _process_packet(pkt) -> None:
         info.update({"proto": "ARP", "src_ip": arp.psrc, "dst_ip": arp.pdst})
         with _lock:
             _stats["arp"] += 1
-        _packet_log.append(dict(info))
+        _log_packet(info)
         _render(info)
         return
 
@@ -492,14 +766,8 @@ def _process_packet(pkt) -> None:
         with _lock:
             _stats["icmp"] += 1
         info["intel"] = _infer_activity(info)
-        if info["intel"] and info["intel"].get("risk") in ("MEDIUM", "HIGH"):
-            _investigation_hits.append({
-                "time": info.get("timestamp", ""),
-                "src": src_ip,
-                "dst": dst_ip,
-                **info["intel"],
-            })
-        _packet_log.append(dict(info))
+        _record_finding(info, src_ip, dst_ip)
+        _log_packet(info)
         _render(info)
         return
 
@@ -515,14 +783,8 @@ def _process_packet(pkt) -> None:
         with _lock:
             _stats["dns"] += 1
         info["intel"] = _infer_activity(info)
-        if info["intel"] and info["intel"].get("risk") in ("MEDIUM", "HIGH"):
-            _investigation_hits.append({
-                "time": info.get("timestamp", ""),
-                "src": src_ip,
-                "dst": dst_ip,
-                **info["intel"],
-            })
-        _packet_log.append(dict(info))
+        _record_finding(info, src_ip, dst_ip)
+        _log_packet(info)
         _render(info)
         return
 
@@ -531,14 +793,8 @@ def _process_packet(pkt) -> None:
         with _lock:
             _stats["udp"] += 1
         info["intel"] = _infer_activity(info)
-        if info["intel"] and info["intel"].get("risk") in ("MEDIUM", "HIGH"):
-            _investigation_hits.append({
-                "time": info.get("timestamp", ""),
-                "src": src_ip,
-                "dst": dst_ip,
-                **info["intel"],
-            })
-        _packet_log.append(dict(info))
+        _record_finding(info, src_ip, dst_ip)
+        _log_packet(info)
         _render(info)
         return
 
@@ -552,7 +808,7 @@ def _process_packet(pkt) -> None:
             "window": tcp.window,
             "seq": tcp.seq,
             "ack": tcp.ack,
-            "process": _find_process(tcp.sport, tcp.dport, src_ip, dst_ip),
+            **_attribution_fields(_find_process(tcp.sport, tcp.dport, src_ip, dst_ip)),
         })
         with _lock:
             _connections[f"{src_ip}:{tcp.sport}"] = {
@@ -581,53 +837,100 @@ def _process_packet(pkt) -> None:
                         "body": h.get("body", ""),
                     })
         info["intel"] = _infer_activity(info)
-        if info["intel"] and info["intel"].get("risk") in ("MEDIUM", "HIGH"):
-            _investigation_hits.append({
-                "time": info.get("timestamp", ""),
-                "src": src_ip,
-                "dst": dst_ip,
-                **info["intel"],
-            })
+        _record_finding(info, src_ip, dst_ip)
         with _lock:
             _stats["tcp"] += 1
-        _packet_log.append(dict(info))
+        _log_packet(info)
         _render(info)
         return
 
     info["intel"] = _infer_activity(info)
-    _packet_log.append(dict(info))
+    _log_packet(info)
     _render(info)
 
 
 def _packet_callback(pkt) -> None:
+    """Sniff callback. Writes the frame to the PCAP immediately so the on-disk
+    capture is complete, then hands the packet to the render worker.
+
+    Rendering is allowed to fall behind and drop; the PCAP never does.
+    """
     global _packet_queue
+    if _pcap_writer is not None:
+        try:
+            _pcap_writer.write(pkt)
+        except (OSError, ValueError) as e:
+            log.warning("PCAP write failed: %s: %s", type(e).__name__, e)
     if _packet_queue is None:
         return
     try:
         _packet_queue.put_nowait(pkt)
     except queue.Full:
-        pass
+        # Render queue saturated. The packet is already on disk; count the
+        # render drop so the session can report it honestly.
+        _stats["render_dropped"] = _stats.get("render_dropped", 0) + 1
 
 
 def _worker_loop() -> None:
-    while not _stop_sniffing or (_packet_queue and not _packet_queue.empty()):
+    """Drain the render queue until stopped AND empty, then exit.
+
+    Runs as a normal (non-daemon) thread so the caller can join it and be
+    certain no processing continues after the module reports it stopped.
+    """
+    global _draining
+    while True:
         try:
-            pkt = _packet_queue.get(timeout=0.5)
+            pkt = _packet_queue.get(timeout=0.3)
         except queue.Empty:
+            if _stop_sniffing:
+                return
             continue
+        if _stop_sniffing and not _draining:
+            # Capture has stopped; finish recording the backlog without paying
+            # for terminal rendering, so shutdown stays bounded.
+            _draining = True
+            qsize = _packet_queue.qsize()
+            if qsize > 50:
+                console.print(f"  [dim]Draining {qsize:,} queued packets...[/dim]")
         try:
             _process_packet(pkt)
-        except Exception as e:
-            log.debug(f"Packet processing error: {e}")
+        except (AttributeError, IndexError, ValueError, KeyError, UnicodeDecodeError) as e:
+            _stats["parse_errors"] = _stats.get("parse_errors", 0) + 1
+            log.warning("packet parse error: %s: %s", type(e).__name__, e)
         finally:
             _packet_queue.task_done()
 
 
 # ── Report Generator ──────────────────────────────────────────────────────────
 
-def _generate_report(save_path:str, iface:str, bpf:str, dur_label:str) -> str:
-    now=datetime.utcnow(); ts_str=now.strftime("%Y-%m-%d %H:%M:%S UTC")
-    elapsed=(now-_stats["start"]).total_seconds(); pps=_stats["total"]/max(elapsed,1)
+def _geo_field(ip: str, key: str) -> str:
+    """Return a GeoIP field, or an explicit marker. Never invents a location."""
+    g = _ips_seen.get(ip, {}) or {}
+    if g.get("source") == "local":
+        return {"country": "LAN", "city": "Local", "org": "Private Network"}.get(key, "LAN")
+    if not g.get("available"):
+        return "UNAVAILABLE"
+    return str(g.get(key) or "UNKNOWN")
+
+
+def _geo_country(p: dict) -> str:
+    ip = p.get("dst_ip") or ""
+    return _geo_field(ip, "country") if ip else ""
+
+
+def _generate_report(save_path: str, session) -> str:
+    """Render the HTML report from THIS session only.
+
+    Every value interpolated below is escaped: captured data (Host headers,
+    User-Agents, DNS names) is attacker-controlled and this document is
+    opened in a browser.
+    """
+    sess = session.to_dict()
+    now = utc_now(); ts_str = now.strftime("%Y-%m-%d %H:%M:%S UTC")
+    elapsed = session.actual_duration
+    pps = _stats["total"] / max(elapsed, 1e-6)
+    iface = sess["interface"]; bpf = sess["bpf_filter"]
+    dur_label = "{:.1f}s measured".format(elapsed)
     protos:dict[str,int]=defaultdict(int)
     for p in _packet_log: protos[p.get("proto","OTHER")]+=1
     dst_counts:dict[str,int]=defaultdict(int)
@@ -643,12 +946,15 @@ def _generate_report(save_path:str, iface:str, bpf:str, dur_label:str) -> str:
     conn_list=list(_connections.values())[:60]
     http_list=_http_requests[:60]
     country_counts:dict[str,int]=defaultdict(int)
-    for ip,g in _ips_seen.items():
-        c=g.get("country","Unknown")
-        if c and c!="Unknown": country_counts[c]+=1
+    for ip, g in _ips_seen.items():
+        if not (g.get("available") or g.get("source") == "local"):
+            continue
+        c = g.get("country")
+        if c and c not in ("Unknown", "UNAVAILABLE"):
+            country_counts[c] += 1
     top_countries=sorted(country_counts.items(),key=lambda x:x[1],reverse=True)[:10]
-    high_hits = [h for h in _investigation_hits if h.get("risk") == "HIGH"][:80]
-    med_hits = [h for h in _investigation_hits if h.get("risk") == "MEDIUM"][:80]
+    high_hits = [x for x in _investigation_hits if x.get("signal") == "STRONG"][:80]
+    med_hits = [x for x in _investigation_hits if x.get("signal") == "MODERATE"][:80]
     max_cnt=top_dsts[0][1] if top_dsts else 1
     max_co =top_countries[0][1] if top_countries else 1
 
@@ -659,67 +965,126 @@ def _generate_report(save_path:str, iface:str, bpf:str, dur_label:str) -> str:
         c="#39d353" if m=="GET" else "#ff4444" if m=="POST" else "#f0e040"
         return f"<span style='font-size:10px;padding:2px 7px;border-radius:3px;border:1px solid {c}44;background:{c}18;color:{c};font-weight:700'>{m}</span>"
 
-    pkt_rows="".join(
-        f"<tr><td class='ts'>{p.get('timestamp','')}</td><td>{badge(p.get('proto','?'))}</td>"
-        f"<td class='mono'>{p.get('src_ip','?')}:{p.get('src_port','')}</td>"
-        f"<td class='mono'>{p.get('dst_ip','?')}:{p.get('dst_port','')}</td>"
-        f"<td class='right'>{p.get('size',0)}B</td>"
-        f"<td class='dim'>{(p.get('geo') or {}).get('country','')}</td>"
-        f"<td class='detail'>{p.get('http',{}).get('method','')+' '+p.get('http',{}).get('host','')+p.get('http',{}).get('path','') if p.get('http') else (p.get('dns') or {}).get('query','')}</td>"
-        f"<td class='detail'>{(p.get('intel') or {}).get('activity','')}</td></tr>"
-        for p in _packet_log[-300:]
-    ) or "<tr><td colspan='8' class='dim'>No packets captured</td></tr>"
+    def _detail_cell(p):
+        if p.get("http"):
+            hh = p.get("http") or {}
+            return esc("{} {}{}".format(hh.get("method", ""), hh.get("host", ""), hh.get("path", "")))
+        if p.get("dns"):
+            return esc((p.get("dns") or {}).get("query", ""))
+        return ""
 
-    intel_rows="".join(
-        f"<tr><td class='ts'>{h.get('time','')}</td>"
-        f"<td class='mono'>{h.get('src','')}</td><td class='mono'>{h.get('dst','')}</td>"
-        f"<td><span style='font-size:10px;padding:2px 7px;border-radius:3px;border:1px solid {'#ff6b6b44' if h.get('risk')=='HIGH' else '#f0e04044'};background:{'#ff6b6b18' if h.get('risk')=='HIGH' else '#f0e04018'};color:{'#ff6b6b' if h.get('risk')=='HIGH' else '#f0e040'};font-weight:700'>{h.get('risk','')}</span></td>"
-        f"<td class='detail'>{h.get('activity','')}</td>"
-        f"<td class='dim'>{h.get('reason','')}</td>"
-        f"<td class='right'>{h.get('confidence',0)}%</td></tr>"
-        for h in (high_hits + med_hits)
-    ) or "<tr><td colspan='7' class='dim'>No medium/high-risk inferences detected</td></tr>"
+    def _proc_cell(p):
+        attr = p.get("process_attribution", "UNKNOWN")
+        name = p.get("process", "")
+        if attr == "EXACT" and name:
+            return esc(name)
+        if attr == "INFERRED" and name:
+            return esc(name) + " <span style='color:#f0e040;font-size:9px'>INFERRED</span>"
+        return "<span class='dim'>UNKNOWN</span>"
 
-    http_rows="".join(
-        f"<tr><td class='ts'>{h['time']}</td><td>{method_badge(h['method'])}</td>"
-        f"<td class='mono'>{h['src']}</td>"
-        f"<td class='detail'>{h['host']}{h['path'][:80]}</td>"
-        f"<td class='dim'>{h['ua'][:50]}</td></tr>"
-        for h in http_list
-    ) or "<tr><td colspan='5' class='dim'>No HTTP requests captured</td></tr>"
+    pkt_rows = "".join(
+        "<tr><td class='ts'>{}</td><td>{}</td>"
+        "<td class='mono'>{}:{}</td><td class='mono'>{}:{}</td>"
+        "<td class='right'>{}B</td><td class='dim'>{}</td>"
+        "<td class='detail'>{}</td><td class='detail'>{}</td>"
+        "<td class='dim'>{}</td></tr>".format(
+            esc(p.get("timestamp", "")),
+            badge(p.get("proto", "?")),
+            esc(p.get("src_ip", "?")), esc(p.get("src_port", "")),
+            esc(p.get("dst_ip", "?")), esc(p.get("dst_port", "")),
+            esc(p.get("size", 0)),
+            esc(_geo_country(p)),
+            _detail_cell(p),
+            esc((p.get("intel") or {}).get("observation", "")),
+            _proc_cell(p),
+        )
+        for p in list(_packet_log)[-300:]
+    ) or "<tr><td colspan='9' class='dim'>No packets captured</td></tr>"
 
-    dns_rows="".join(f"<tr><td class='mono'>{d}</td></tr>" for d in domain_list) or "<tr><td class='dim'>No DNS queries</td></tr>"
-    conn_rows="".join(
-        f"<tr><td class='mono'>{c.get('src','')}:{c.get('sport','')}</td>"
-        f"<td class='mono'>{c.get('dst','')}:{c.get('dport','')}</td>"
-        f"<td class='dim'>{c.get('flags','')}</td></tr>"
+    def _sig_badge(sig):
+        col = {"STRONG": "#ff6b6b", "MODERATE": "#f0e040"}.get(sig, "#888")
+        return ("<span style='font-size:10px;padding:2px 7px;border-radius:3px;"
+                "border:1px solid {c}44;background:{c}18;color:{c};font-weight:700'>{s}</span>"
+                ).format(c=col, s=esc(sig))
+
+    def _evidence_cell(x):
+        ev = x.get("evidence") or []
+        if not ev:
+            return "<span class='dim'>no scored indicators</span>"
+        return "<br>".join(
+            "+{} {} <span class='dim'>({})</span>".format(
+                esc(e.get("weight", 0)), esc(e.get("indicator", "")), esc(e.get("basis", "")))
+            for e in ev[:4]
+        )
+
+    intel_rows = "".join(
+        "<tr><td class='ts'>{}</td><td class='mono'>{}</td><td class='mono'>{}</td>"
+        "<td>{}</td><td class='detail'>{}</td><td class='dim'>{}</td>"
+        "<td class='right'>{}/100</td></tr>".format(
+            esc(x.get("time", "")), esc(x.get("src", "")), esc(x.get("dst", "")),
+            _sig_badge(x.get("signal", "")),
+            esc(x.get("observation", "")),
+            _evidence_cell(x),
+            esc(x.get("score", 0)),
+        )
+        for x in (high_hits + med_hits)
+    ) or "<tr><td colspan='7' class='dim'>No scored indicators observed in this capture</td></tr>"
+
+    http_rows = "".join(
+        "<tr><td class='ts'>{}</td><td>{}</td><td class='mono'>{}</td>"
+        "<td class='detail'>{}</td><td class='dim'>{}</td></tr>".format(
+            esc(x["time"]), method_badge(x["method"]), esc(x["src"]),
+            esc(str(x["host"]) + str(x["path"])[:80]), esc(str(x["ua"])[:50]),
+        )
+        for x in http_list
+    ) or "<tr><td colspan='5' class='dim'>No cleartext HTTP observed (HTTPS is not decrypted)</td></tr>"
+
+    dns_rows = "".join(
+        "<tr><td class='mono'>{}</td></tr>".format(esc(d)) for d in domain_list
+    ) or "<tr><td class='dim'>No DNS queries observed</td></tr>"
+    conn_rows = "".join(
+        "<tr><td class='mono'>{}:{}</td><td class='mono'>{}:{}</td><td class='dim'>{}</td></tr>".format(
+            esc(c.get("src", "")), esc(c.get("sport", "")),
+            esc(c.get("dst", "")), esc(c.get("dport", "")), esc(c.get("flags", "")))
         for c in conn_list
-    ) or "<tr><td colspan='3' class='dim'>No connections tracked</td></tr>"
+    ) or "<tr><td colspan='3' class='dim'>No connections observed</td></tr>"
 
-    ip_rows="".join(
-        f"<tr><td class='mono'>{ip}</td><td class='right'>{cnt}</td>"
-        f"<td class='dim'>{_ips_seen.get(ip,{}).get('country','LAN')}</td>"
-        f"<td class='dim'>{_ips_seen.get(ip,{}).get('org','')[:35]}</td>"
-        f"<td><div style='width:{int(cnt/max_cnt*100)}px;height:6px;background:#00d4ff44;border-radius:2px'></div></td></tr>"
-        for ip,cnt in top_dsts
+    ip_rows = "".join(
+        "<tr><td class='mono'>{}</td><td class='right'>{}</td><td class='dim'>{}</td>"
+        "<td class='dim'>{}</td><td><div style='width:{}px;height:6px;"
+        "background:#00d4ff44;border-radius:2px'></div></td></tr>".format(
+            esc(ip), esc(cnt), esc(_geo_field(ip, "country")),
+            esc(str(_geo_field(ip, "org"))[:35]), int(cnt / max_cnt * 100))
+        for ip, cnt in top_dsts
     ) or "<tr><td colspan='5' class='dim'>No destination data</td></tr>"
 
-    ip_intel_rows="".join(
-        f"<tr><td class='mono'>{ip}</td>"
-        f"<td class='dim'>{_dns_cache.get(ip,'')}</td>"
-        f"<td class='dim'>{_ips_seen.get(ip,{}).get('country','')}</td>"
-        f"<td class='dim'>{_ips_seen.get(ip,{}).get('city','')}</td>"
-        f"<td class='mono'>{float(_ips_seen.get(ip,{}).get('lat',0.0)):.5f}</td>"
-        f"<td class='mono'>{float(_ips_seen.get(ip,{}).get('lon',0.0)):.5f}</td>"
-        f"<td class='dim'>{_ips_seen.get(ip,{}).get('org','')[:30]}</td></tr>"
-        for ip,_ in top_ips
+    def _coord(ip, key):
+        g = _ips_seen.get(ip, {}) or {}
+        if not (g.get("available") or g.get("source") == "local"):
+            return "UNAVAILABLE"
+        v = g.get(key)
+        return "{:.5f}".format(float(v)) if isinstance(v, (int, float)) else "UNKNOWN"
+
+    ip_intel_rows = "".join(
+        "<tr><td class='mono'>{}</td><td class='dim'>{}</td><td class='dim'>{}</td>"
+        "<td class='dim'>{}</td><td class='mono'>{}</td><td class='mono'>{}</td>"
+        "<td class='dim'>{}</td></tr>".format(
+            esc(ip),
+            esc(_dns_cache.get(ip) or "NOT RESOLVED"),
+            esc(_geo_field(ip, "country")),
+            esc(_geo_field(ip, "city")),
+            esc(_coord(ip, "lat")), esc(_coord(ip, "lon")),
+            esc(str(_geo_field(ip, "org"))[:30]),
+        )
+        for ip, _ in top_ips
     ) or "<tr><td colspan='7' class='dim'>No IP intelligence collected</td></tr>"
 
-    country_rows="".join(
-        f"<tr><td>{co}</td><td class='right'>{cnt}</td>"
-        f"<td><div style='width:{int(cnt/max_co*120)}px;height:6px;background:#c09ffd44;border-radius:2px'></div></td></tr>"
-        for co,cnt in top_countries
-    ) or "<tr><td colspan='3' class='dim'>No geo data</td></tr>"
+    country_rows = "".join(
+        "<tr><td>{}</td><td class='right'>{}</td><td><div style='width:{}px;height:6px;"
+        "background:#c09ffd44;border-radius:2px'></div></td></tr>".format(
+            esc(co), esc(cnt), int(cnt / max_co * 120))
+        for co, cnt in top_countries
+    ) or "<tr><td colspan='3' class='dim'>No geo data available</td></tr>"
 
     def _proto_bar(p, v):
         col = proto_colors.get(p, "#888")
@@ -737,6 +1102,18 @@ def _generate_report(save_path:str, iface:str, bpf:str, dur_label:str) -> str:
         _proto_bar(p, v)
         for p, v in sorted(protos.items(), key=lambda x: x[1], reverse=True) if v > 0
     )
+
+    limitation_rows = "".join(
+        "<tr><td colspan='2'>{}</td></tr>".format(esc(t)) for t in sess["limitations"]
+    ) or "<tr><td colspan='2' class='dim'>None recorded</td></tr>"
+    unavailable_rows = "".join(
+        "<tr><td class='mono'>{}</td><td class='dim'>{}</td></tr>".format(
+            esc(u["feature"]), esc(u["reason"])) for u in sess["unavailable_features"]
+    ) or "<tr><td colspan='2' class='dim'>Nothing was unavailable</td></tr>"
+    error_rows = "".join(
+        "<tr><td class='mono'>{}</td><td class='dim'>{}</td></tr>".format(
+            esc(e["where"]), esc(e["error"])) for e in sess["errors"]
+    ) or "<tr><td colspan='2' class='dim'>No errors recorded</td></tr>"
 
     html=f"""<!DOCTYPE html>
 <html lang="en">
@@ -808,10 +1185,14 @@ tr:hover td{{background:#0d110d}}
     </div>
   </div>
   <div class="meta-row">
-    <div class="meta-card"><div class="l">Interface</div><div class="v">{iface or "auto"}</div></div>
-    <div class="meta-card"><div class="l">BPF Filter</div><div class="v">{bpf or "none — all traffic"}</div></div>
-    <div class="meta-card"><div class="l">Duration</div><div class="v">{dur_label}</div></div>
-    <div class="meta-card"><div class="l">Session Start</div><div class="v">{_stats['start'].strftime('%H:%M:%S UTC')}</div></div>
+    <div class="meta-card"><div class="l">Session ID</div><div class="v">{esc(sess["session_id"])}</div></div>
+    <div class="meta-card"><div class="l">Status</div><div class="v">{esc(sess["status"])}</div></div>
+    <div class="meta-card"><div class="l">Interface</div><div class="v">{esc(iface or "auto")}</div></div>
+    <div class="meta-card"><div class="l">BPF Filter</div><div class="v">{esc(bpf or "none — all traffic")}</div></div>
+    <div class="meta-card"><div class="l">Requested</div><div class="v">{esc(sess["requested_duration_seconds"] or "until stopped")}</div></div>
+    <div class="meta-card"><div class="l">Measured</div><div class="v">{sess["actual_duration_seconds"]:.1f}s</div></div>
+    <div class="meta-card"><div class="l">Started</div><div class="v">{esc(sess["started_at"])}</div></div>
+    <div class="meta-card"><div class="l">Ended</div><div class="v">{esc(sess["ended_at"] or "NOT RECORDED")}</div></div>
     <div class="meta-card"><div class="l">Avg Pkt/sec</div><div class="v">{pps:.1f}</div></div>
     <div class="meta-card"><div class="l">Unique IPs</div><div class="v">{len(_ips_seen):,}</div></div>
     <div class="meta-card"><div class="l">Unique Domains</div><div class="v">{len(_domains_seen):,}</div></div>
@@ -853,13 +1234,13 @@ tr:hover td{{background:#0d110d}}
     </div>
 
     <div class="section">
-        <div class="sh">Investigation Highlights <span class="sub">— medium/high confidence events</span></div>
-        <table><tr><th>Time</th><th>Source</th><th>Destination</th><th>Risk</th><th>Possible Activity</th><th>Why</th><th>Confidence</th></tr>{intel_rows}</table>
+        <div class="sh">Scored Observations <span class="sub">— indicators that actually fired, with their basis</span></div>
+        <table><tr><th>Time</th><th>Source</th><th>Destination</th><th>Signal</th><th>Observation</th><th>Evidence (weight &amp; basis)</th><th>Score</th></tr>{intel_rows}</table>
     </div>
 
     <div class="section">
         <div class="sh">Packet Log <span class="sub">— last {min(300,len(_packet_log))} of {len(_packet_log):,} captured</span></div>
-        <table><tr><th>Time</th><th>Proto</th><th>Source</th><th>Destination</th><th>Size</th><th>Country</th><th>Detail</th><th>Possible Activity</th></tr>{pkt_rows}</table>
+        <table><tr><th>Time</th><th>Proto</th><th>Source</th><th>Destination</th><th>Size</th><th>Country</th><th>Detail</th><th>Observation</th><th>Process</th></tr>{pkt_rows}</table>
   </div>
 
   <div class="section">
@@ -880,6 +1261,34 @@ tr:hover td{{background:#0d110d}}
 
 </div>
 
+<div class="body">
+  <div class="sh">Provenance &amp; Limitations <span class="sub">— what this report can and cannot establish</span></div>
+  <table>
+    <tr><th>Field</th><th>Value</th></tr>
+    <tr><td>Packets captured</td><td class="mono">{_stats['total']:,}</td></tr>
+    <tr><td>Packets rendered/analysed</td><td class="mono">{len(_packet_log):,}</td></tr>
+    <tr><td>Render drops (present in PCAP)</td><td class="mono">{_stats.get('render_dropped', 0):,}</td></tr>
+    <tr><td>Parse errors</td><td class="mono">{_stats.get('parse_errors', 0):,}</td></tr>
+    <tr><td>Cleartext HTTP messages parsed</td><td class="mono">{_stats.get('http', 0):,}</td></tr>
+    <tr><td>Session status</td><td class="mono">{esc(sess['status'])}</td></tr>
+    <tr><td>Duration honoured</td><td class="mono">{esc('n/a (open-ended)' if sess['duration_honored'] is None else ('YES' if sess['duration_honored'] else 'NO'))}</td></tr>
+  </table>
+  <div style="margin-top:18px"></div>
+  <div class="sh">Limitations</div>
+  <table>
+    {limitation_rows}
+  </table>
+  <div style="margin-top:18px"></div>
+  <div class="sh">Unavailable This Run</div>
+  <table>
+    {unavailable_rows}
+  </table>
+  <div style="margin-top:18px"></div>
+  <div class="sh">Errors Recorded</div>
+  <table>
+    {error_rows}
+  </table>
+</div>
 <div class="footer">
   <div class="fl">
     PacketPulse Network Forensic Capture Report<br>
@@ -888,7 +1297,7 @@ tr:hover td{{background:#0d110d}}
   </div>
   <div class="fr">
     <div class="fb">PacketPulse | Dreamwalker4u</div>
-    <div class="fs">Network Forensics Platform  •  v1.0.2</div>
+    <div class="fs">Network Forensics Platform  •  v{__version__}</div>
   </div>
 </div>
 <div class="wm">PacketPulse | Dreamwalker4u  •  Network Forensic Capture Report  •  {ts_str}</div>
@@ -903,11 +1312,11 @@ tr:hover td{{background:#0d110d}}
 def _packet_intel_line(p: dict) -> str:
     intel = p.get("intel") or {}
     if not intel:
-        return "activity=unknown risk=LOW conf=0%"
-    return (
-        f"activity={intel.get('activity','unknown')} "
-        f"risk={intel.get('risk','LOW')} "
-        f"conf={intel.get('confidence',0)}%"
+        return "observation=none signal=NONE score=0"
+    return "observation={} signal={} score={}".format(
+        intel.get("observation", "none"),
+        intel.get("signal", "NONE"),
+        intel.get("score", 0),
     )
 
 
@@ -921,16 +1330,15 @@ def _packet_detail_line(p: dict) -> str:
     return ""
 
 
-def _endpoint_intel(ip: str) -> tuple[dict, str]:
-    """Return GeoIP + reverse DNS for endpoint IP (LAN returns local placeholder)."""
+def _endpoint_intel(ip: str):
+    """GeoIP + reverse DNS for an endpoint, without blocking the packet path."""
     if not ip:
-        return ({"country": "Unknown", "city": "Unknown", "lat": 0.0, "lon": 0.0, "org": ""}, "")
+        return ({"country": UNKNOWN, "city": UNKNOWN, "lat": 0.0, "lon": 0.0,
+                 "org": "", "source": "none", "available": False}, "")
     if is_private_ip(ip):
-        return ({"country": "LAN", "city": "Local", "lat": 0.0, "lon": 0.0, "org": "Private Network"}, "")
-
+        return ({"country": "LAN", "city": "Local", "lat": 0.0, "lon": 0.0,
+                 "org": "Private Network", "source": "local", "available": True}, "")
     geo = _geo(ip)
-    if ip not in _dns_cache:
-        _dns_cache[ip] = reverse_dns(ip)
     return geo, _dns_cache.get(ip, "")
 
 
@@ -943,196 +1351,125 @@ def _fmt_ip(ip: str) -> str:
     return ip
 
 
-def _analyze_capture_summary(iface: str, dur_label: str) -> dict:
-    packets = _packet_log
+def _analyze_capture_summary(session) -> dict:
+    """Summarise what was actually observed.
+
+    This function reports counts and describes patterns. It does not assign an
+    overall "risk" — the previous version defaulted to MEDIUM regardless of
+    evidence and averaged hardcoded confidence values into a percentage. Where
+    a pattern merely resembles a known protocol, the language says so.
+    """
+    packets = list(_packet_log)
     total = len(packets)
+    observed: list[str] = []
+    not_determinable: list[str] = [
+        "Payload contents of TLS/HTTPS traffic (encrypted; not decrypted)",
+        "Domains inside encrypted tunnels or DNS-over-HTTPS",
+        "File names or content transferred over encrypted channels",
+        "Process ownership of sockets belonging to other users without elevation",
+    ]
+
     if total == 0:
+        if session.get("packets_captured"):
+            headline = ["Packets were captured but no records were retained for analysis."]
+        else:
+            headline = ["No packets were captured during this session."]
         return {
-            "headline": ["No packets captured; investigation summary unavailable."],
-            "key_intel": [],
-            "can_extract": [],
-            "cannot_extract": [],
-            "verdict": "No traffic captured",
+            "headline": headline,
+            "observed": [],
+            "not_determinable": not_determinable,
+            "summary": "NO DATA — nothing was observed to analyse.",
+            "signal_counts": {},
         }
 
     proto_counts = Counter((p.get("proto") or "OTHER") for p in packets)
-    udp_only = proto_counts.get("UDP", 0) == total
-    unique_ips = set()
     port_counts = Counter()
-    confs = []
-
+    unique_ips = set()
     for p in packets:
-        si = p.get("src_ip")
-        di = p.get("dst_ip")
-        if si:
-            unique_ips.add(si)
-        if di:
-            unique_ips.add(di)
+        for key in ("src_ip", "dst_ip"):
+            if p.get(key):
+                unique_ips.add(p[key])
         for po in (p.get("src_port"), p.get("dst_port")):
             if po:
                 try:
                     port_counts[int(po)] += 1
-                except Exception:
-                    pass
-        intel = p.get("intel") or {}
-        if intel.get("confidence") is not None:
-            try:
-                confs.append(int(intel.get("confidence")))
-            except Exception:
-                pass
+                except (TypeError, ValueError):
+                    continue
 
-    avg_conf = round(sum(confs) / len(confs), 1) if confs else 0.0
+    elapsed = session.actual_duration if hasattr(session, "actual_duration") else 0.0
+    pps = _stats["total"] / max(elapsed, 1e-6)
 
-    # Infer local/private and remote/public peers.
-    src_counts = Counter(p.get("src_ip") for p in packets if p.get("src_ip"))
-    dst_counts = Counter(p.get("dst_ip") for p in packets if p.get("dst_ip"))
-    ip_counts = src_counts + dst_counts
-
-    private_ips = [ip for ip in ip_counts if is_private_ip(ip)]
-    public_ips = [ip for ip in ip_counts if not is_private_ip(ip)]
-
-    local_ip = max(private_ips, key=lambda i: ip_counts[i]) if private_ips else (max(ip_counts, key=ip_counts.get) if ip_counts else "")
-    remote_ip = max(public_ips, key=lambda i: ip_counts[i]) if public_ips else ""
-
-    inbound = 0
-    outbound = 0
-    if local_ip and remote_ip:
-        for p in packets:
-            if p.get("src_ip") == remote_ip and p.get("dst_ip") == local_ip:
-                inbound += 1
-            elif p.get("src_ip") == local_ip and p.get("dst_ip") == remote_ip:
-                outbound += 1
-
-    # Size classes.
-    sz_data = sum(1 for p in packets if 1200 <= int(p.get("size", 0)) <= 1600)
-    sz_ack = sum(1 for p in packets if 100 <= int(p.get("size", 0)) <= 200)
-    sz_other = total - sz_data - sz_ack
-
-    # 500ms packet-rate timeline and burst detection.
-    bucket = defaultdict(int)
-    t_vals = []
-    for p in packets:
-        ts = p.get("timestamp", "")
-        if not ts:
-            continue
-        try:
-            dt = datetime.strptime(ts, "%H:%M:%S.%f")
-            sec = dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1_000_000.0
-            bi = int(sec * 2)
-            bucket[bi] += 1
-            t_vals.append(sec)
-        except Exception:
-            continue
-
-    burst_start = "n/a"
-    burst_end = "n/a"
-    if bucket:
-        keys = sorted(bucket)
-        run_start = None
-        prev = None
-        best_len = 0
-        best_range = None
-        # >= 8 packets per 500ms ~= >= 16 packets/sec burst.
-        hot = {k for k, v in bucket.items() if v >= 8}
-        for k in keys:
-            if k in hot:
-                if run_start is None:
-                    run_start = k
-                elif prev is not None and k != prev + 1:
-                    ln = prev - run_start + 1
-                    if ln > best_len:
-                        best_len = ln
-                        best_range = (run_start, prev)
-                    run_start = k
-                prev = k
-            else:
-                if run_start is not None and prev is not None:
-                    ln = prev - run_start + 1
-                    if ln > best_len:
-                        best_len = ln
-                        best_range = (run_start, prev)
-                run_start = None
-                prev = None
-        if run_start is not None and prev is not None:
-            ln = prev - run_start + 1
-            if ln > best_len:
-                best_range = (run_start, prev)
-        if best_range:
-            b0, b1 = best_range
-            burst_start = time.strftime("%H:%M:%S", time.gmtime(b0 / 2))
-            burst_end = time.strftime("%H:%M:%S", time.gmtime((b1 + 1) / 2))
-
-    dominant_port = port_counts.most_common(1)[0][0] if port_counts else None
-    wireguard_like = bool(
-        udp_only and dominant_port == 51820 and remote_ip and not is_private_ip(remote_ip)
-    )
-
-    elapsed = (datetime.utcnow() - _stats["start"]).total_seconds()
-    pps = _stats["total"] / max(elapsed, 1)
-
-    risk = "MEDIUM"
-    if wireguard_like:
-        risk = "LOW"
-    elif _investigation_hits and any(h.get("risk") == "HIGH" for h in _investigation_hits):
-        risk = "HIGH"
+    signal_counts = Counter(x.get("signal", "NONE") for x in _investigation_hits)
 
     headline = [
-        f"{_stats['total']:,} total packets | {'100% UDP only' if udp_only else 'mixed protocols'} | {dur_label} capture | {pps:.1f} packets/sec",
-        f"{human_bytes(_stats['bytes'])} transferred | {len(unique_ips)} unique IPs | {len(port_counts)} ports used | {avg_conf}% avg confidence",
+        "{:,} packets captured in {:.1f}s ({:.1f} packets/sec)".format(_stats["total"], elapsed, pps),
+        "{} transferred | {} unique addresses | {} distinct ports".format(
+            human_bytes(_stats["bytes"]), len(unique_ips), len(port_counts)),
     ]
 
-    key_intel = []
-    if wireguard_like:
-        key_intel.append(
-            f"WireGuard VPN tunnel likely confirmed on port 51820 between {local_ip or 'local host'} and {remote_ip}."
-        )
-    if inbound or outbound:
-        direction = "download-heavy" if inbound > outbound else "upload-heavy" if outbound > inbound else "balanced"
-        key_intel.append(
-            f"Traffic direction appears {direction}: inbound ~{inbound} packets vs outbound ~{outbound} packets."
-        )
-    key_intel.append(
-        f"Packet sizes: 1200-1600B ~{sz_data} packets, 100-200B ~{sz_ack} packets, other sizes ~{sz_other} packets."
-    )
-    if burst_start != "n/a":
-        key_intel.append(
-            f"Burst activity window detected around {burst_start} to {burst_end} (500ms buckets)."
-        )
-    if _stats.get("tcp", 0) == 0 and _stats.get("dns", 0) == 0 and _stats.get("http", 0) == 0:
-        key_intel.append(
-            "No plaintext TCP/HTTP/DNS observed in this capture window; traffic appears encrypted/opaque."
-        )
+    # Protocol composition — a fact.
+    observed.append("Protocol mix: " + ", ".join(
+        "{} {}".format(k, v) for k, v in proto_counts.most_common(6)))
 
-    can_extract = [
-        f"Primary peer IP: {remote_ip or 'unknown'}",
-        f"Session duration estimate: {dur_label}",
-        f"Transferred volume: {human_bytes(_stats['bytes'])}",
-        f"Likely activity: {'VPN tunnel / bulk transfer' if wireguard_like else 'network session analysis from metadata'}",
-        f"Direction split: inbound ~{inbound}, outbound ~{outbound}",
-        f"Burst window: {burst_start} -> {burst_end}" if burst_start != "n/a" else "Burst window: no sustained burst detected",
-    ]
-    cannot_extract = [
-        "Exact payload contents when traffic is encrypted",
-        "Visited websites/domains hidden inside encrypted tunnels",
-        "Downloaded file names/content when payload is encrypted",
-        "True final destinations behind VPN/relay endpoints",
-    ]
+    if _stats.get("http", 0) == 0:
+        observed.append(
+            "No cleartext HTTP observed. Any web traffic present was encrypted, "
+            "so request contents are not available.")
+    else:
+        observed.append("{} cleartext HTTP messages observed and parsed.".format(_stats["http"]))
 
-    verdict = (
-        f"Protocol profile: {'WireGuard-like UDP tunnel' if wireguard_like else 'Mixed/unknown traffic profile'} | "
-        f"Risk: {risk} | Peer: {remote_ip or 'unknown'}:{dominant_port or 'n/a'}"
-    )
+    if _stats.get("dns", 0):
+        observed.append("{} DNS messages observed; {} unique names.".format(
+            _stats["dns"], len(_domains_seen)))
+    else:
+        observed.append("No DNS traffic observed in this capture window.")
+
+    # Dominant port — described, not diagnosed.
+    if port_counts:
+        dport, dcount = port_counts.most_common(1)[0]
+        share = dcount / max(sum(port_counts.values()), 1) * 100
+        note = ""
+        if dport == 51820 and proto_counts.get("UDP", 0) == total:
+            note = (" This is the port WireGuard commonly uses; the traffic is "
+                    "consistent with a WireGuard tunnel but was not verified as one.")
+        elif dport in _SERVICE_PORTS:
+            note = " Commonly associated with {}.".format(_SERVICE_PORTS[dport][0])
+        observed.append("Most frequent port: {} ({:.0f}% of port observations).{}".format(
+            dport, share, note))
+
+    # Render drops and parse errors are reported, not hidden.
+    if _stats.get("render_dropped"):
+        observed.append(
+            "{} packets were not rendered because the display queue was saturated; "
+            "they are present in the PCAP.".format(_stats["render_dropped"]))
+    if _stats.get("parse_errors"):
+        observed.append("{} packets could not be parsed.".format(_stats["parse_errors"]))
+
+    if _investigation_hits:
+        observed.append("Scored indicators: {} STRONG, {} MODERATE.".format(
+            signal_counts.get("STRONG", 0), signal_counts.get("MODERATE", 0)))
+    else:
+        observed.append("No scored indicators fired on the captured traffic.")
+
+    if signal_counts.get("STRONG"):
+        summary = "{} observation(s) with STRONG evidence — review the findings table.".format(
+            signal_counts["STRONG"])
+    elif signal_counts.get("MODERATE"):
+        summary = "{} observation(s) with MODERATE evidence; no strong indicators.".format(
+            signal_counts["MODERATE"])
+    else:
+        summary = "No threat indicators observed in the captured data."
 
     return {
         "headline": headline,
-        "key_intel": key_intel,
-        "can_extract": can_extract,
-        "cannot_extract": cannot_extract,
-        "verdict": verdict,
+        "observed": observed,
+        "not_determinable": not_determinable,
+        "summary": summary,
+        "signal_counts": dict(signal_counts),
     }
 
 
-def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -> str:
+def _generate_pdf_report(save_path: str, session) -> str:
     if not PDF_OK:
         raise RuntimeError("reportlab is not installed. Install dependency 'reportlab'.")
 
@@ -1233,8 +1570,12 @@ def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -
         c.setFont("Helvetica-Bold", 16)
         c.drawString(x + 10, top - 40, value)
 
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    summary = _analyze_capture_summary(iface, dur_label)
+    sess = session.to_dict()
+    iface = sess["interface"]
+    bpf = sess["bpf_filter"]
+    dur_label = "{:.1f}s measured".format(session.actual_duration)
+    ts = utc_now().strftime("%Y-%m-%d %H:%M:%S UTC")
+    summary = _analyze_capture_summary(session)
     packets = list(_packet_log)
 
     ip_counts: Counter = Counter()
@@ -1292,12 +1633,12 @@ def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -
         else:
             size_bins["1600+B"] += 1
 
-    risk_counter = Counter((h.get("risk") or "LOW").upper() for h in _investigation_hits)
-    high_ips = {h.get("src") for h in _investigation_hits if (h.get("risk") or "").upper() == "HIGH"} | {
-        h.get("dst") for h in _investigation_hits if (h.get("risk") or "").upper() == "HIGH"
+    risk_counter = Counter((x.get("signal") or "NONE").upper() for x in _investigation_hits)
+    high_ips = {x.get("src") for x in _investigation_hits if x.get("signal") == "STRONG"} | {
+        x.get("dst") for x in _investigation_hits if x.get("signal") == "STRONG"
     }
-    medium_ips = {h.get("src") for h in _investigation_hits if (h.get("risk") or "").upper() == "MEDIUM"} | {
-        h.get("dst") for h in _investigation_hits if (h.get("risk") or "").upper() == "MEDIUM"
+    medium_ips = {x.get("src") for x in _investigation_hits if x.get("signal") == "MODERATE"} | {
+        x.get("dst") for x in _investigation_hits if x.get("signal") == "MODERATE"
     }
     high_ips.discard(None)
     medium_ips.discard(None)
@@ -1312,16 +1653,20 @@ def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -
         timeline[sec] += 1
     timeline_items = sorted(timeline.items(), key=lambda x: x[0])
     timeline_top = timeline_items[-40:] if len(timeline_items) > 40 else timeline_items
-    timeline_max = max((v for _, v in timeline_top), default=1)
+    timeline_max = max((v for _, v in timeline_top), default=1) or 1
 
     avg_rate = (sum(v for _, v in timeline_items) / len(timeline_items)) if timeline_items else 0
     peak_time, peak_count = max(timeline_items, key=lambda x: x[1]) if timeline_items else ("n/a", 0)
 
-    overall_risk = "LOW"
-    if risk_counter.get("HIGH", 0) > 0:
-        overall_risk = "HIGH"
-    elif risk_counter.get("MEDIUM", 0) > 0:
-        overall_risk = "MEDIUM"
+    # Evidence level, not a risk verdict: describes how much was observed.
+    if risk_counter.get("STRONG", 0) > 0:
+        overall_risk = "STRONG"
+    elif risk_counter.get("MODERATE", 0) > 0:
+        overall_risk = "MODERATE"
+    elif _stats["total"] == 0:
+        overall_risk = "NO DATA"
+    else:
+        overall_risk = "NONE"
 
     # 1) Cover Page
     _apply_fill(palette["bg"])
@@ -1334,7 +1679,11 @@ def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -
     c.drawCentredString(width / 2, height * 0.57, "Session / Capture Summary")
     c.setFont("Helvetica", 11)
     c.drawCentredString(width / 2, height * 0.50, f"Generated: {ts}")
-    c.drawCentredString(width / 2, height * 0.47, f"Interface: {iface or 'auto'} | Filter: {bpf or 'none'} | Duration: {dur_label}")
+    c.drawCentredString(width / 2, height * 0.47,
+                        "Interface: {} | Filter: {} | {}".format(iface or "auto", bpf or "none", dur_label))
+    c.setFont("Helvetica", 9)
+    c.drawCentredString(width / 2, height * 0.44,
+                        "Session {} | HTTPS payloads were NOT decrypted".format(sess["session_id"]))
     _apply_fill((0.08, 0.15, 0.26))
     _apply_stroke(palette["green"])
     c.setLineWidth(1)
@@ -1356,7 +1705,7 @@ def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -
         ("Total Packets", f"{_stats['total']:,}", palette["cyan"]),
         ("Data Transferred", human_bytes(_stats["bytes"]), palette["green"]),
         ("Unique IPs", f"{unique_ips:,}", palette["yellow"]),
-        ("Risk Level", overall_risk, palette["orange"] if overall_risk == "MEDIUM" else palette["red"] if overall_risk == "HIGH" else palette["green"]),
+        ("Evidence Level", overall_risk, palette["orange"] if overall_risk == "MODERATE" else palette["red"] if overall_risk == "STRONG" else palette["green"]),
         ("Duration", dur_label, palette["muted"]),
     ]
     card_w = (content_w - 18) / 2
@@ -1393,15 +1742,29 @@ def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -
     pie_x = margin + 95
     pie_y = y - 95
     pie_r = 70
-    total_dir = max(inbound + outbound, 1)
+    total_dir = max(inbound + outbound, 1)  # guard: no traffic in one direction
     in_deg = 360 * inbound / total_dir
     out_deg = 360 - in_deg
 
     _apply_stroke(palette["line"])
-    _apply_fill(palette["cyan"])
-    c.wedge(pie_x - pie_r, pie_y - pie_r, pie_x + pie_r, pie_y + pie_r, 90, -in_deg, stroke=1, fill=1)
-    _apply_fill(palette["orange"])
-    c.wedge(pie_x - pie_r, pie_y - pie_r, pie_x + pie_r, pie_y + pie_r, 90 - in_deg, -out_deg, stroke=1, fill=1)
+    # reportlab raises ZeroDivisionError on a zero-extent wedge, which happens
+    # whenever traffic ran in only one direction. Draw only real slices, and
+    # say so plainly when there is no directional data at all.
+    if inbound + outbound == 0:
+        _apply_fill(palette["panel"])
+        c.circle(pie_x, pie_y, pie_r, stroke=1, fill=1)
+        _apply_fill(palette["muted"])
+        c.setFont("Helvetica", 9)
+        c.drawCentredString(pie_x, pie_y, "NO DIRECTIONAL DATA")
+    else:
+        if in_deg > 0:
+            _apply_fill(palette["cyan"])
+            c.wedge(pie_x - pie_r, pie_y - pie_r, pie_x + pie_r, pie_y + pie_r,
+                    90, -in_deg, stroke=1, fill=1)
+        if out_deg > 0:
+            _apply_fill(palette["orange"])
+            c.wedge(pie_x - pie_r, pie_y - pie_r, pie_x + pie_r, pie_y + pie_r,
+                    90 - in_deg, -out_deg, stroke=1, fill=1)
     _apply_fill(palette["text"])
     c.setFont("Helvetica-Bold", 10)
     c.drawCentredString(pie_x, pie_y + pie_r + 12, "Inbound vs Outbound")
@@ -1415,7 +1778,8 @@ def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -
     c.setFont("Helvetica-Bold", 10)
     c.drawString(bx, by, "Protocol Distribution")
     by -= 16
-    max_proto = max(proto_counts.values()) if proto_counts else 1
+    max_proto = max(proto_counts.values()) if proto_counts else 0
+    max_proto = max_proto or 1
     for proto, val in proto_counts.items():
         _apply_fill(palette["muted"])
         c.setFont("Helvetica", 9)
@@ -1433,10 +1797,11 @@ def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -
     c.setFont("Helvetica-Bold", 10)
     c.drawString(margin, y, "Packet Size Histogram")
     y -= 14
-    max_bin = max(size_bins.values()) if size_bins else 1
+    max_bin = max(size_bins.values()) if size_bins else 0
+    max_bin = max_bin or 1
     x_cursor = margin
     bar_area_h = 92
-    bar_w = (content_w - 20) / len(size_bins)
+    bar_w = (content_w - 20) / max(len(size_bins), 1)
     for label, val in size_bins.items():
         bh = int((val / max_bin) * bar_area_h) if max_bin else 0
         _apply_fill(palette["panel"])
@@ -1453,7 +1818,7 @@ def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -
     # 4) IP Intelligence
     _apply_fill(palette["bg"])
     c.rect(0, 0, width, height, stroke=0, fill=1)
-    _section_title("IP Intelligence", "Color-coded endpoint table with risk hints")
+    _section_title("IP Intelligence", "Observed endpoints and evidence level")
 
     _draw_wrapped_text(
         f"Primary peer: {primary_peer or 'n/a'} | Suspicious endpoints: {len(high_ips | medium_ips)}",
@@ -1485,12 +1850,12 @@ def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -
         geo = _ips_seen.get(ip, {})
         country = geo.get("country", "LAN")
         org = (geo.get("org", "Private Network") or "Private Network")[:34]
-        risk = "LOW"
+        risk = "NONE"
         if ip in high_ips:
-            risk = "HIGH"
+            risk = "STRONG"
         elif ip in medium_ips:
-            risk = "MEDIUM"
-        risk_color = palette["green"] if risk == "LOW" else palette["orange"] if risk == "MEDIUM" else palette["red"]
+            risk = "MODERATE"
+        risk_color = palette["orange"] if risk == "MODERATE" else palette["red"] if risk == "STRONG" else palette["green"]
 
         _apply_stroke(palette["line"])
         c.setLineWidth(0.5)
@@ -1510,9 +1875,9 @@ def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -
     # 5) Key Findings + 6) Risk Analysis
     _apply_fill(palette["bg"])
     c.rect(0, 0, width, height, stroke=0, fill=1)
-    _section_title("Key Findings", "Human-friendly investigation insights")
+    _section_title("Observations", "Facts derived from the captured data")
 
-    findings = list(summary.get("key_intel", []))
+    findings = list(summary.get("observed", []))
     if inbound + outbound > 0:
         findings.insert(0, f"Download-heavy traffic: {(inbound / max(inbound + outbound, 1)) * 100:.1f}% inbound.")
     if peak_count and avg_rate and peak_count > avg_rate * 1.8:
@@ -1527,13 +1892,13 @@ def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -
         y -= 2
 
     y -= 8
-    _section_title("Risk Analysis", "Why this session is categorized as low/medium/high")
+    _section_title("Evidence Summary", "How many scored indicators fired, and at what strength")
     total_events = max(len(_investigation_hits), 1)
-    low_events = max(total_events - risk_counter.get("MEDIUM", 0) - risk_counter.get("HIGH", 0), 0)
+    low_events = max(total_events - risk_counter.get("MODERATE", 0) - risk_counter.get("STRONG", 0), 0)
     risk_rows = [
-        ("LOW", low_events, palette["green"]),
-        ("MEDIUM", risk_counter.get("MEDIUM", 0), palette["orange"]),
-        ("HIGH", risk_counter.get("HIGH", 0), palette["red"]),
+        ("WEAK/NONE", low_events, palette["green"]),
+        ("MODERATE", risk_counter.get("MODERATE", 0), palette["orange"]),
+        ("STRONG", risk_counter.get("STRONG", 0), palette["red"]),
     ]
     for level, count, col in risk_rows:
         _apply_fill(palette["panel"])
@@ -1547,10 +1912,9 @@ def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -
         y -= 22
 
     explanation = (
-        "Why medium? Medium risk usually indicates encrypted or atypical sessions without direct malicious payload evidence. "
-        "It implies continued monitoring is recommended, especially for repeated medium-risk peers and bursty UDP traffic."
-        if overall_risk == "MEDIUM"
-        else "Risk level is based on observed intelligence events and confidence scores within this capture window."
+        "Evidence level reflects the strongest scored indicator observed in this capture window. "
+        "Scores are the sum of documented indicator weights; each indicator records the basis on "
+        "which it fired. This is a measure of what was observed, not a probability of compromise."
     )
     y = _draw_wrapped_text(explanation, margin, y - 2, 112, font="Helvetica", size=9, color=palette["muted"], line_gap=11)
     _new_page("Findings and Risk")
@@ -1590,9 +1954,9 @@ def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -
         timeline_events = [
             {
                 "time": p.get("timestamp", ""),
-                "activity": (p.get("intel") or {}).get("activity", "Packet observed"),
+                "activity": (p.get("intel") or {}).get("observation", "Packet observed"),
                 "proto": p.get("proto", "OTHER"),
-                "risk": (p.get("intel") or {}).get("risk", "LOW"),
+                "signal": (p.get("intel") or {}).get("signal", "NONE"),
             }
             for p in packets[-14:]
         ]
@@ -1602,8 +1966,8 @@ def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -
         tval = e.get("time", "n/a")
         event = (e.get("activity", "Event") or "Event")[:44]
         typ = (e.get("proto") or e.get("type") or "NET")[:7]
-        risk = (e.get("risk") or "LOW").upper()
-        risk_color = palette["green"] if risk == "LOW" else palette["orange"] if risk == "MEDIUM" else palette["red"]
+        risk = (e.get("signal") or "NONE").upper()
+        risk_color = palette["orange"] if risk == "MODERATE" else palette["red"] if risk == "STRONG" else palette["green"]
         _apply_fill(palette["text"])
         c.setFont("Helvetica", 8)
         c.drawString(margin, y, f"{tval}")
@@ -1622,16 +1986,13 @@ def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -
     c.roundRect(margin, y - 90, content_w, 88, 8, stroke=1, fill=1)
     _apply_fill(palette["cyan"])
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(margin + 12, y - 18, "Final Verdict")
+    c.drawString(margin + 12, y - 18, "Session Summary")
     _apply_fill(palette["text"])
     c.setFont("Helvetica", 10)
-    c.drawString(margin + 12, y - 36, f"Risk Level: {overall_risk}")
-    likely_activity = (summary.get("verdict", "") or "Network activity observed")[:90]
-    c.drawString(margin + 12, y - 52, f"Likely Activity: {likely_activity}")
-    avg_conf = 0.0
-    if _investigation_hits:
-        avg_conf = round(sum(int(h.get("confidence", 0) or 0) for h in _investigation_hits) / len(_investigation_hits), 1)
-    c.drawString(margin + 12, y - 68, f"Confidence: {avg_conf:.1f}%")
+    c.drawString(margin + 12, y - 36, "Evidence Level: {}".format(overall_risk))
+    c.drawString(margin + 12, y - 52, (summary.get("summary", "") or "No summary")[:90])
+    c.drawString(margin + 12, y - 68, "Status: {} | Measured duration: {:.1f}s".format(
+        sess["status"], session.actual_duration))
     _new_page("Timeline and Verdict")
 
     # 8) Detailed Logs Appendix (last section)
@@ -1660,7 +2021,7 @@ def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -
         src = f"{p.get('src_ip', '?')}:{p.get('src_port', '')}"
         dst = f"{p.get('dst_ip', '?')}:{p.get('dst_port', '')}"
         sz = int(p.get("size", 0) or 0)
-        risk = ((p.get("intel") or {}).get("risk", "LOW") or "LOW").upper()
+        risk = ((p.get("intel") or {}).get("signal", "NONE") or "NONE").upper()
         line = f"{idx:04d} {t} {proto:4} {src:27} -> {dst:27} {sz:5}B {risk:6}"
         _apply_fill(palette["text"])
         c.drawString(margin, y, line[:130])
@@ -1672,7 +2033,8 @@ def _generate_pdf_report(save_path: str, iface: str, bpf: str, dur_label: str) -
 
 
 def _print_stats() -> None:
-    elapsed=(datetime.utcnow()-_stats["start"]).total_seconds(); pps=_stats["total"]/max(elapsed,1)
+    elapsed = (utc_now() - _stats["start"]).total_seconds()
+    pps = _stats["total"] / max(elapsed, 1e-6)
     console.print(
         f"\n[dim]── STATS ──[/dim]  total=[green]{_stats['total']:,}[/green]  "
         f"TCP=[cyan]{_stats['tcp']:,}[/cyan]  UDP=[yellow]{_stats['udp']:,}[/yellow]  "
@@ -1686,90 +2048,356 @@ def _fmt_dur(s:int)->str:
     if s>=60: return f"{s//60}m {s%60}s"
     return f"{s}s"
 
-def run_sniffer(interface:Optional[str]=None,bpf_filter:str="",count:int=0,duration:int=0,save_pcap:bool=True)->None:
-    global _sniff_start_time,_sniff_duration,_stop_sniffing,_stats
-    global _packet_log,_connections,_domains_seen,_ips_seen,_http_requests,_captured_packets,_investigation_hits
-    global _packet_queue,_worker_thread
-    if not SCAPY_OK: console.print("[red]ERROR: scapy not installed.[/red]"); return
-    _stop_sniffing=False; _sniff_duration=duration; _sniff_start_time=time.time() if duration>0 else None
-    _stats={"total":0,"tcp":0,"udp":0,"icmp":0,"arp":0,"other":0,"bytes":0,"http":0,"dns":0,"start":datetime.utcnow()}
-    _packet_log.clear(); _connections.clear(); _domains_seen.clear()
-    _ips_seen.clear(); _http_requests.clear(); _captured_packets.clear(); _investigation_hits.clear()
-    _packet_queue = queue.Queue()
-    _worker_thread = threading.Thread(target=_worker_loop, daemon=True)
-    _worker_thread.start()
-    cfg=get_config().sensor; iface=interface or cfg.interface; dur_label=_fmt_dur(duration)
-    console.rule("[bold green]PACKETPULSE — DEEP PACKET SNIFFER[/bold green]")
-    console.print(f"  [dim]Interface:[/dim] [green]{iface or 'auto'}[/green]  [dim]Filter:[/dim] [yellow]{bpf_filter or 'none'}[/yellow]  [dim]Duration:[/dim] [yellow]{dur_label}[/yellow]")
-    console.print("  [dim]A full forensic report (HTML + PDF + JSON) will be generated when capture ends.[/dim]")
-    console.print("[dim]"+"─"*100+"[/dim]\n")
+# In-memory record limit for report tables. This is SEPARATE from the PCAP,
+# which is streamed to disk and is never truncated by this value.
+RENDER_LOG_LIMIT = 50000
+
+
+def _reset_session_state() -> None:
+    """Clear every module global so run N+1 cannot inherit run N's data."""
+    global _stats, _packet_log, _investigation_hits
+    _stats = {"total": 0, "tcp": 0, "udp": 0, "icmp": 0, "arp": 0, "other": 0,
+              "bytes": 0, "http": 0, "dns": 0, "start": utc_now()}
+    _packet_log = deque(maxlen=RENDER_LOG_LIMIT)
+    _investigation_hits = []
+    _connections.clear()
+    _domains_seen.clear()
+    _ips_seen.clear()
+    _http_requests.clear()
+    _geo_cache.clear()
+    _dns_cache.clear()
+    _attribution_blocked["reason"] = ""
+    with _enrich_lock:
+        _enrich_requested.clear()
+
+
+def run_sniffer(
+    interface=None,
+    bpf_filter: str = "",
+    count: int = 0,
+    duration: int = 0,
+    save_pcap: bool = True,
+    stop=None,
+    session=None,
+):
+    """Capture live packets and produce verified artifacts.
+
+    Returns the Session describing what actually happened. This function
+    starts its worker, honours the stop signal and duration, joins every
+    thread it created, closes every file it opened, and only then returns.
+    """
+    global _sniff_start_time, _sniff_duration, _stop_sniffing, _draining
+    global _packet_queue, _worker_thread, _pcap_writer, _ndjson_fh
+
+    _user_iface = bool(interface)
+    stop = stop or StopController()
+    cfg = get_config().sensor
+    # Fall back to the OS route interface, not scapy's default: on a host
+    # with a VPN tunnel those differ and the default sees no internet traffic.
+    iface = interface or cfg.interface or capabilities.default_route_interface()
+    session = session or Session(
+        module="sniffer",
+        requested_duration=duration,
+        interface=str(iface or "default"),
+        bpf_filter=bpf_filter,
+    )
+
+    if not SCAPY_OK:
+        reason = SCAPY_UNAVAILABLE_REASON or "scapy is not installed"
+        session.record_unavailable("Packet capture", reason)
+        session.finish(completed=False, abort_reason=reason)
+        console.print("[red]Packet capture UNAVAILABLE:[/red] " + reason)
+        return session
+
+    cap = capabilities.probe_capture()
+    if not cap.available:
+        session.record_unavailable("Packet capture", cap.reason)
+        session.finish(completed=False, abort_reason=cap.reason)
+        console.print("[red]Packet capture UNAVAILABLE:[/red] " + cap.reason)
+        console.print("  [dim]" + capabilities.privilege_hint() + "[/dim]")
+        return session
+
+    # Load the capture backend before resolving/using a named interface.
+    _load_secs = capabilities.ensure_capture_backend(iface)
+    if _load_secs > 5:
+        console.print("  [dim]Capture engine loaded in %.1fs (full adapter "
+                      "enumeration was required).[/dim]" % _load_secs)
+
+    ok, detail = capabilities.resolve_interface(iface)
+    if not ok:
+        if _user_iface:
+            # The user named this interface explicitly; do not silently
+            # capture somewhere else.
+            session.record_unavailable("Capture interface", detail)
+            session.finish(completed=False, abort_reason=detail)
+            console.print("[red]CANNOT START:[/red] " + detail)
+            return session
+        # Auto-detected interface is not resolvable by the capture backend
+        # (observed on Linux, where the routing interface may not appear in
+        # scapy's list). Fall back to the platform default and say so, rather
+        # than refusing to run.
+        console.print("  [yellow]Auto-detected interface unusable:[/yellow] " + detail)
+        console.print("  [dim]Falling back to the platform default interface.[/dim]")
+        session.note_limitation(
+            "Auto-detected interface %r could not be opened (%s); the platform "
+            "default was used instead, so the captured traffic may differ from "
+            "the routed path." % (iface, detail))
+        iface = None
+        session.interface = "platform default"
+
+
+    _reset_session_state()
+    _stop_sniffing = False
+    _draining = False
+    _sniff_duration = duration
+    _sniff_start_time = time.time() if duration > 0 else None
+
+    _compat = scapy_compat.COMPAT_NOTE
+    if _compat:
+        session.note_limitation(_compat)
+    session.note_limitation(capabilities.interface_note(iface))
+    session.note_limitation(
+        "TLS/HTTPS payloads are encrypted and were not decrypted; only endpoint "
+        "metadata (addresses, ports, sizes, timing) is available for that traffic."
+    )
+    session.note_limitation(
+        "In-memory packet records are capped at {:,} for report tables; the PCAP "
+        "and NDJSON written to disk are complete.".format(RENDER_LOG_LIMIT)
+    )
+    if not cfg.geoip_db:
+        if cfg.geoip_online:
+            session.note_limitation(
+                "GeoIP resolved via ip-api.com: observed addresses were sent to a "
+                "third party, and results are approximate (city-level at best).")
+        else:
+            session.record_unavailable(
+                "GeoIP enrichment",
+                "no local database (PACKETPULSE_GEOIP_DB) and online lookup disabled")
+    if not capabilities.is_admin():
+        session.note_limitation(
+            "Process attribution is limited without elevated privileges: the OS "
+            "hides socket ownership for processes owned by other users."
+        )
+
     ensure_dir(cfg.pcap_store_path)
+    stamp = timestamp_filename()
+    base = Path(cfg.pcap_store_path)
+    pcap_path = str(base / ("session_" + stamp + ".pcap"))
+    ndjson_path = str(base / ("report_" + stamp + ".ndjson"))
+
+    _pcap_writer = None
+    if save_pcap:
+        try:
+            _pcap_writer = PcapWriter(pcap_path, append=False, sync=False)
+        except (OSError, PermissionError) as e:
+            session.record_error("pcap_open", e)
+            session.record_unavailable("PCAP output", "cannot open {}: {}".format(pcap_path, e))
+            console.print("[yellow]PCAP output UNAVAILABLE: {}[/yellow]".format(e))
     try:
-        sniff(iface=iface or None,filter=bpf_filter or None,prn=_packet_callback,
-              stop_filter=_should_stop,count=count or 0,store=False)
+        _ndjson_fh = open(ndjson_path, "w", encoding="utf-8")
+    except OSError as e:
+        _ndjson_fh = None
+        session.record_error("ndjson_open", e)
+
+    _enrich_start()
+
+    # Worker is NOT a daemon: we join it before returning.
+    _packet_queue = queue.Queue(maxsize=100000)
+    _worker_thread = threading.Thread(target=_worker_loop, name="pp-sensor-worker", daemon=False)
+    _worker_thread.start()
+
+    dur_label = _fmt_dur(duration)
+    console.rule("[bold green]PACKETPULSE - DEEP PACKET SNIFFER[/bold green]")
+    console.print(
+        "  [dim]Interface:[/dim] [green]{}[/green]  [dim]Filter:[/dim] [yellow]{}[/yellow]  "
+        "[dim]Duration:[/dim] [yellow]{}[/yellow]  [dim]Session:[/dim] [cyan]{}[/cyan]".format(
+            iface or "default", bpf_filter or "none", dur_label, session.session_id)
+    )
+    console.print("  [dim]HTTPS payloads are encrypted and are NOT decrypted.[/dim]")
+    console.print("[dim]" + "-" * 100 + "[/dim]")
+
+    aborted = ""
+    session.begin_capture()
+    try:
+        sniff(
+            iface=iface,
+            filter=bpf_filter or None,
+            prn=_packet_callback,
+            stop_filter=lambda pkt: stop.is_set() or _should_stop(pkt),
+            timeout=duration if duration > 0 else None,
+            count=count or 0,
+            store=False,
+        )
     except KeyboardInterrupt:
-        pass
-    except PermissionError:
-        console.print("[red]ERROR: Requires root/sudo.[/red]")
-        _stop_sniffing = True
-        if _packet_queue:
-            _packet_queue.join()
-        return
-    except Exception as e:
-        console.print(f"[red]Sniffer error: {e}[/red]")
-        _stop_sniffing = True
-        if _packet_queue:
-            _packet_queue.join()
-        return
+        console.print("\n  [yellow]Interrupted - finishing cleanly...[/yellow]")
+    except PermissionError as e:
+        aborted = "insufficient privilege for live capture: {}".format(e)
+        session.record_error("sniff", e)
+    except ValueError as e:
+        aborted = "interface error: {}".format(e)
+        session.record_error("sniff_iface", e)
+    except OSError as e:
+        aborted = "capture failed: {}".format(e)
+        session.record_error("sniff", e)
     finally:
+        session.end_capture()
+        stop.stop()
         _stop_sniffing = True
-        if _packet_queue:
-            _packet_queue.join()
-        if _worker_thread:
-            _worker_thread.join(timeout=2)
+        if _worker_thread and _worker_thread.is_alive():
+            _worker_thread.join(timeout=15)
+            if _worker_thread.is_alive():
+                session.record_error("worker_join", "worker thread did not terminate within 15s")
+        # Drain enrichment so late GeoIP/rDNS results still reach the report.
+        pending = _enrich_pending_count()
+        if pending:
+            console.print(f"  [dim]Resolving endpoint metadata ({pending} addresses)...[/dim]")
+        unresolved = _enrich_shutdown()
+        _backfill_geo()
+        if unresolved:
+            session.note_limitation(
+                f"{unresolved} address(es) were not resolved before the deadline and "
+                "are reported as NOT RESOLVED rather than guessed.")
+        if _pcap_writer is not None:
+            try:
+                _pcap_writer.close()
+            except OSError as e:
+                session.record_error("pcap_close", e)
+        if _ndjson_fh is not None:
+            try:
+                _ndjson_fh.close()
+            except OSError as e:
+                session.record_error("ndjson_close", e)
+            finally:
+                _ndjson_fh = None
+
+    session.count("packets_captured", _stats["total"])
+    session.count("bytes_captured", _stats["bytes"])
+    for k in ("tcp", "udp", "icmp", "arp", "dns", "http"):
+        if _stats.get(k):
+            session.count(k, _stats[k])
+    session.count("unique_domains", len(_domains_seen))
+    session.count("findings", len(_investigation_hits))
+    session.finish(completed=not aborted, abort_reason=aborted)
+
+    if aborted:
+        console.print("\n[red]CAPTURE FAILED:[/red] " + aborted)
+        console.print("  [dim]" + capabilities.privilege_hint() + "[/dim]")
+        return session
+
     _print_stats()
-    if save_pcap and _captured_packets:
-        fname=f"{cfg.pcap_store_path}/session_{timestamp_filename()}.pcap"
-        try: wrpcap(fname,_captured_packets); console.print(f"\n[green]PCAP saved →[/green] [cyan]{fname}[/cyan]")
-        except Exception as e: console.print(f"[yellow]PCAP save failed: {e}[/yellow]")
-    console.print("\n[dim]Generating forensic report...[/dim]")
-    rpath=f"{cfg.pcap_store_path}/report_{timestamp_filename()}.html"
+
+    artifacts = {}
+    if save_pcap and _pcap_writer is not None:
+        verified, detail = _verify_pcap(pcap_path, _stats["total"])
+        if verified:
+            artifacts["pcap"] = pcap_path
+            console.print("\n[green]PCAP verified ->[/green] [cyan]{}[/cyan]  [dim]{}[/dim]".format(pcap_path, detail))
+        else:
+            session.record_error("pcap_verify", detail)
+            console.print("\n[yellow]PCAP NOT VERIFIED:[/yellow] " + detail)
+    if Path(ndjson_path).exists():
+        artifacts["ndjson"] = ndjson_path
+
+    _write_reports(session, cfg, stamp, artifacts)
+    return session
+
+
+def _backfill_geo() -> None:
+    """Attach enrichment that arrived after a packet was rendered.
+
+    _ips_seen is what the report reads, so refresh it from the resolved caches
+    once the pool has drained. Addresses that never resolved keep their
+    unavailable marker.
+    """
+    for ip in list(_ips_seen.keys()):
+        if ip in _geo_cache:
+            _ips_seen[ip] = _geo_cache[ip]
+
+
+def _verify_pcap(path: str, expected: int):
+    """Re-read the written PCAP and count frames. Never assume the write worked."""
     try:
-        out=_generate_report(rpath,iface or "auto",bpf_filter,dur_label)
-        console.print(f"\n[bold green]╔════════════════════════════════════════════════╗[/bold green]")
-        console.print(f"[bold green]║  REPORT READY  —  PacketPulse | Dreamwalker4u  ║[/bold green]")
-        console.print(f"[bold green]╚════════════════════════════════════════════════╝[/bold green]")
-        console.print(f"  [dim]HTML →[/dim] [bold cyan]{out}[/bold cyan]")
-        console.print(f"  [dim]Open in any browser to view the full forensic report.[/dim]\n")
-    except Exception as e: console.print(f"[red]Report failed: {e}[/red]")
-    try:
-        pp=rpath.replace(".html", ".pdf")
-        pdf_out=_generate_pdf_report(pp,iface or "auto",bpf_filter,dur_label)
-        console.print(f"  [dim]PDF  →[/dim] [bold cyan]{pdf_out}[/bold cyan]\n")
+        if not Path(path).exists():
+            return False, "file was not created"
+        size = Path(path).stat().st_size
+        n = 0
+        with PcapReader(path) as rd:
+            for _ in rd:
+                n += 1
+        if expected and n != expected:
+            return False, "{} frames on disk vs {} counted in session".format(n, expected)
+        return True, "{:,} frames, {}".format(n, human_bytes(size))
     except Exception as e:
-        console.print(f"[yellow]PDF report failed: {e}[/yellow]")
+        return False, "{}: {}".format(type(e).__name__, e)
+
+
+def _write_reports(session, cfg, stamp, artifacts) -> None:
+    """Generate HTML/PDF/JSON from this session only."""
+    base = Path(cfg.pcap_store_path)
+    console.print("\n[dim]Generating report from captured data...[/dim]")
+
+    rpath = str(base / ("report_" + stamp + ".html"))
     try:
-        jp=rpath.replace(".html",".json")
-        save_json({"session":{"interface":iface,"filter":bpf_filter,"duration":dur_label,"generated":now_str()},
-                   "stats":{k:v for k,v in _stats.items() if k!="start"},
-                   "dns_queries":list(_domains_seen),"http_requests":_http_requests[:100],
-                   "connections":list(_connections.values())[:100],
-                   "investigation_hits":_investigation_hits[:200],
-                   "ip_intelligence":[
-                       {
-                           "ip": ip,
-                           "rdns": _dns_cache.get(ip, ""),
-                           "country": _ips_seen.get(ip, {}).get("country", ""),
-                           "city": _ips_seen.get(ip, {}).get("city", ""),
-                           "lat": _ips_seen.get(ip, {}).get("lat", 0.0),
-                           "lon": _ips_seen.get(ip, {}).get("lon", 0.0),
-                           "org": _ips_seen.get(ip, {}).get("org", ""),
-                       }
-                       for ip in sorted(_ips_seen.keys())
-                   ]},jp)
-        console.print(f"  [dim]JSON →[/dim] [cyan]{jp}[/cyan]\n")
-        ndjp = rpath.replace(".html",".ndjson")
-        save_ndjson(_packet_log, ndjp)
-        console.print(f"  [dim]NDJSON →[/dim] [cyan]{ndjp}[/cyan]\n")
+        _generate_report(rpath, session)
+        artifacts["html"] = rpath
+        console.print("  [dim]HTML   ->[/dim] [cyan]{}[/cyan]".format(rpath))
     except Exception as e:
-        console.print(f"[yellow]JSON/NDJSON save failed: {e}[/yellow]")
+        session.record_error("html_report", e)
+        console.print("  [red]HTML report FAILED:[/red] {}".format(e))
+
+    if PDF_OK:
+        pp = str(base / ("report_" + stamp + ".pdf"))
+        try:
+            _generate_pdf_report(pp, session)
+            artifacts["pdf"] = pp
+            console.print("  [dim]PDF    ->[/dim] [cyan]{}[/cyan]".format(pp))
+        except Exception as e:
+            session.record_error("pdf_report", e)
+            console.print("  [yellow]PDF report FAILED:[/yellow] {}".format(e))
+    else:
+        session.record_unavailable("PDF reports", "reportlab is not installed")
+
+    jp = str(base / ("report_" + stamp + ".json"))
+    try:
+        save_json(
+            {
+                "session": session.to_dict(),
+                "capabilities_unavailable": capabilities.unavailable_features(),
+                "artifacts": dict(artifacts),
+                "dns_queries_observed": sorted(_domains_seen),
+                "http_requests_observed": _http_requests[:200],
+                "connections_observed": list(_connections.values())[:200],
+                "findings": _investigation_hits[:300],
+                "ip_intelligence": _ip_intel_records(),
+            },
+            jp,
+        )
+        artifacts["json"] = jp
+        console.print("  [dim]JSON   ->[/dim] [cyan]{}[/cyan]".format(jp))
+    except Exception as e:
+        session.record_error("json_report", e)
+        console.print("  [red]JSON report FAILED:[/red] {}".format(e))
+
+    console.print("\n  [bold]{}[/bold]".format(session.summary_line()))
+    if session.unavailable:
+        console.print("  [yellow]Unavailable this run:[/yellow]")
+        for u in session.unavailable:
+            console.print("    [dim]- {}: {}[/dim]".format(u["feature"], u["reason"]))
+
+
+def _ip_intel_records():
+    """GeoIP records for observed addresses. Unresolved entries say so."""
+    out = []
+    for ip in sorted(_ips_seen.keys()):
+        g = _ips_seen.get(ip) or {}
+        available = bool(g.get("available", False)) or g.get("source") == "local"
+        out.append({
+            "ip": ip,
+            "rdns": _dns_cache.get(ip) or "NOT RESOLVED",
+            "geoip_available": available,
+            "country": g.get("country") if available else "UNAVAILABLE",
+            "city": g.get("city") if available else "UNAVAILABLE",
+            "org": g.get("org") or "UNKNOWN",
+            "source": g.get("source", "none"),
+        })
+    return out

@@ -17,12 +17,18 @@ class SensorConfig:
     show_geoip: bool = True
     show_http: bool = True
     show_dns: bool = True
-    geoip_db: str = ""          # path to GeoLite2-City.mmdb
+    geoip_db: str = ""          # path to GeoLite2-City.mmdb (offline, private)
+    # Online GeoIP transmits every observed address to a third party and is
+    # rate limited. Off unless the operator turns it on.
+    geoip_online: bool = False
 
 
 @dataclass
 class URLScanConfig:
     enabled: bool = True
+    # External reputation services receive the URL/domain being checked.
+    # Off by default; the CLI asks before enabling.
+    allow_external: bool = False
     fetch_page: bool = True
     virustotal_api_key: str = ""
     google_safebrowsing_key: str = ""
