@@ -568,7 +568,7 @@ def _arp_scan(subnet: Optional[str] = None) -> list[dict]:
                 parts = route_ip.split(".")
                 subnet = "{}.{}.{}.0/24".format(parts[0], parts[1], parts[2])
             else:
-                for iface, addrs in psutil.net_if_addrs().items():
+                for _iface, addrs in psutil.net_if_addrs().items():
                     for addr in addrs:
                         if (addr.family == socket.AF_INET
                                 and not addr.address.startswith(("127.", "169.254."))):

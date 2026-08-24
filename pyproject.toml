@@ -74,7 +74,17 @@ target-version = "py311"
 # Correctness and safety rules. Cosmetic reformatting of the existing dense
 # report-generation code is deliberately not enforced.
 select = ["F", "E4", "E7", "E9", "B", "S102", "S103", "S108", "S602", "S604", "S605"]
-ignore = ["E402", "E741", "B008"]
+ignore = [
+    "E402",  # imports after a platform/encoding guard are intentional here
+    "E741",  # single-letter names in the existing report builders
+    "B008",  # function calls in argument defaults
+    # E701/E702 flag `if x: return` and `a = 1; b = 2`. The original capture and
+    # report modules are written in that compact style throughout; reformatting
+    # ~100 sites would be a large diff with no behavioural benefit, so the style
+    # is accepted rather than silently failing every lint run.
+    "E701",
+    "E702",
+]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101"]
