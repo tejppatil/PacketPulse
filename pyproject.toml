@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "packetpulse"
-version = "1.0.2"
+dynamic = ["version"]
 description = "Terminal-based modular cybersecurity monitoring platform"
 readme = "README.md"
 license = { text = "MIT" }
@@ -17,6 +17,8 @@ classifiers = [
     "Intended Audience :: Information Technology",
     "Intended Audience :: System Administrators",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -28,7 +30,7 @@ dependencies = [
     "scapy>=2.5.0",
     "rich>=13.0.0",
     "requests>=2.31.0",
-    "psutil>=5.9.0",
+    "psutil>=6.0.0",
     "pyyaml>=6.0",
     "dnspython>=2.4.0",
     "python-whois>=0.8.0",
@@ -45,6 +47,9 @@ dependencies = [
     "reportlab>=4.2.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.5", "build", "twine"]
+
 [project.urls]
 Homepage = "https://github.com/tejppatil/PacketPulse"
 Repository = "https://github.com/tejppatil/PacketPulse"
@@ -54,6 +59,25 @@ Issues = "https://github.com/tejppatil/PacketPulse/issues"
 [project.scripts]
 packetpulse = "packetpulse:main"
 
+[tool.setuptools.dynamic]
+version = {attr = "packetpulse.__version__"}
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["packetpulse*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+# Correctness and safety rules. Cosmetic reformatting of the existing dense
+# report-generation code is deliberately not enforced.
+select = ["F", "E4", "E7", "E9", "B", "S102", "S103", "S108", "S602", "S604", "S605"]
+ignore = ["E402", "E741", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

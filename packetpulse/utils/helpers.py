@@ -2,15 +2,19 @@
 PacketPulse — Utility Helpers
 """
 from __future__ import annotations
+import atexit
 import math
+import os
 import re
 import socket
 import json
 import hashlib
-from datetime import datetime
+import threading
+from datetime import datetime, timezone
+from html import escape as _html_escape
+from ipaddress import ip_address, ip_network
 from pathlib import Path
 from textwrap import wrap
-from typing import Optional
 
 try:
     from reportlab.lib.pagesizes import letter
@@ -18,6 +22,10 @@ try:
     REPORTLAB_OK = True
 except ImportError:
     REPORTLAB_OK = False
+
+UNKNOWN = "UNKNOWN"
+NOT_OBSERVED = "NOT OBSERVED"
+UNAVAILABLE = "UNAVAILABLE"
 
 GEOIP_CACHE_FILE = Path.home() / ".packetpulse" / "geoip_cache.json"
 _geoip_cache: dict[str, dict] = {}
@@ -33,13 +41,35 @@ def _load_geoip_cache() -> None:
         _geoip_cache = {}
 
 
-def _save_geoip_cache() -> None:
-    try:
-        GEOIP_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with GEOIP_CACHE_FILE.open("w", encoding="utf-8") as f:
-            json.dump(_geoip_cache, f, indent=2)
-    except Exception:
-        pass
+_geoip_dirty = False
+_geoip_lock = threading.Lock()
+
+
+def _save_geoip_cache(force: bool = False) -> None:
+    """Persist the cache atomically.
+
+    Previously this rewrote the whole file on every new address from inside the
+    packet-processing thread, and a Ctrl+C mid-write left invalid JSON that
+    silently reset the cache. Now writes are debounced and atomic.
+    """
+    global _geoip_dirty
+    with _geoip_lock:
+        if not (_geoip_dirty or force):
+            return
+        try:
+            GEOIP_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = GEOIP_CACHE_FILE.with_suffix(".tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(_geoip_cache, f, indent=2)
+            os.replace(tmp, GEOIP_CACHE_FILE)
+            _geoip_dirty = False
+        except OSError:
+            # Cache persistence is a convenience; failing to write it must not
+            # interrupt a capture. The in-memory cache stays valid.
+            pass
+
+
+atexit.register(lambda: _save_geoip_cache(force=True))
 
 
 # Load persistent GeoIP cache at import.
@@ -48,80 +78,148 @@ _load_geoip_cache()
 
 # ── GeoIP ─────────────────────────────────────────────────────────────────────
 
-def geoip_lookup(ip: str, db_path: str = "") -> dict:
-    """
-    Return GeoIP data for an IP address.
-    Uses geoip2 with a local MaxMind DB if available, else falls back
-    to the free ip-api.com endpoint (no key required, rate-limited).
-    Results are cached persistently across sessions.
+def geoip_lookup(ip: str, db_path: str = "", allow_online: bool = False) -> dict:
+    """Resolve an address to a location.
+
+    Order of preference:
+      1. Local MaxMind database, when one is configured. Fast, offline, private.
+      2. ip-api.com, ONLY when `allow_online` is explicitly true.
+
+    When neither is available the result is marked UNAVAILABLE. It is never
+    filled with a placeholder location, and a failed lookup is never cached as
+    a fact.
+
+    Online lookup is opt-in because it transmits every observed address to a
+    third party and is rate limited (45 requests/minute on the free tier).
     """
     if not ip or is_private_ip(ip):
-        return {"country": "LAN", "city": "Local", "lat": 0.0, "lon": 0.0, "org": "Private Network", "source": "local"}
+        return {"country": "LAN", "city": "Local", "lat": 0.0, "lon": 0.0,
+                "org": "Private Network", "source": "local", "available": True}
 
     if ip in _geoip_cache:
         return _geoip_cache[ip]
 
-    result = {"country": "Unknown", "city": "Unknown", "lat": 0.0, "lon": 0.0, "org": "", "source": "none"}
+    global _geoip_dirty
 
     if db_path and Path(db_path).exists():
         try:
             import geoip2.database
+            import geoip2.errors
+
             with geoip2.database.Reader(db_path) as reader:
                 r = reader.city(ip)
                 result = {
-                    "country": r.country.name or "Unknown",
+                    "country": r.country.name or UNKNOWN,
                     "country_code": r.country.iso_code or "??",
-                    "city": r.city.name or "Unknown",
+                    "city": r.city.name or UNKNOWN,
                     "lat": float(r.location.latitude or 0),
                     "lon": float(r.location.longitude or 0),
                     "org": "",
                     "source": "maxmind",
+                    "available": True,
                 }
-        except Exception:
-            pass
+                _geoip_cache[ip] = result
+                _geoip_dirty = True
+                return result
+        except Exception as e:  # geoip2 raises several unrelated types
+            name = type(e).__name__
+            if name != "AddressNotFoundError":
+                return {"country": UNAVAILABLE, "city": UNAVAILABLE, "lat": 0.0,
+                        "lon": 0.0, "org": "", "source": "none", "available": False,
+                        "reason": "MaxMind lookup failed: {}".format(name)}
 
-    if result["source"] == "none":
-        try:
-            import requests
-            r = requests.get(
-                f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,city,lat,lon,org,isp",
-                timeout=3,
-            )
-            if r.status_code == 200:
-                d = r.json()
-                if d.get("status") == "success":
-                    result = {
-                        "country": d.get("country", "Unknown"),
-                        "country_code": d.get("countryCode", "??"),
-                        "city": d.get("city", "Unknown"),
-                        "lat": d.get("lat", 0.0),
-                        "lon": d.get("lon", 0.0),
-                        "org": d.get("org", d.get("isp", "")),
-                        "source": "ip-api",
-                    }
-        except Exception:
-            pass
+    if not allow_online:
+        return {"country": UNAVAILABLE, "city": UNAVAILABLE, "lat": 0.0, "lon": 0.0,
+                "org": "", "source": "none", "available": False,
+                "reason": "No local GeoIP database configured and online lookup "
+                          "is disabled (set PACKETPULSE_GEOIP_DB, or enable "
+                          "external enrichment)"}
 
-    _geoip_cache[ip] = result
-    _save_geoip_cache()
-    return result
+    try:
+        import requests
+
+        r = requests.get(
+            "https://ip-api.com/json/{}?fields=status,country,countryCode,city,lat,lon,org,isp".format(ip),
+            timeout=3,
+        )
+        if r.status_code == 200:
+            d = r.json()
+            if d.get("status") == "success":
+                result = {
+                    "country": d.get("country", UNKNOWN),
+                    "country_code": d.get("countryCode", "??"),
+                    "city": d.get("city", UNKNOWN),
+                    "lat": d.get("lat", 0.0),
+                    "lon": d.get("lon", 0.0),
+                    "org": d.get("org") or d.get("isp", ""),
+                    "source": "ip-api",
+                    "available": True,
+                }
+                _geoip_cache[ip] = result
+                _geoip_dirty = True
+                return result
+            return {"country": UNAVAILABLE, "city": UNAVAILABLE, "lat": 0.0, "lon": 0.0,
+                    "org": "", "source": "none", "available": False,
+                    "reason": "ip-api reported: {}".format(d.get("message", "no result"))}
+        return {"country": UNAVAILABLE, "city": UNAVAILABLE, "lat": 0.0, "lon": 0.0,
+                "org": "", "source": "none", "available": False,
+                "reason": "ip-api HTTP {}".format(r.status_code)}
+    except Exception as e:
+        return {"country": UNAVAILABLE, "city": UNAVAILABLE, "lat": 0.0, "lon": 0.0,
+                "org": "", "source": "none", "available": False,
+                "reason": "ip-api request failed: {}".format(type(e).__name__)}
+
+
+_CGNAT4 = ip_network("100.64.0.0/10")
 
 
 def is_private_ip(ip: str) -> bool:
-    """Check if IP is in private/reserved range."""
-    private = [
-        r"^10\.", r"^172\.(1[6-9]|2[0-9]|3[01])\.",
-        r"^192\.168\.", r"^127\.", r"^::1$", r"^fc", r"^fe80",
-    ]
-    return any(re.match(p, ip) for p in private)
+    """True for addresses that are not globally routable.
 
-
-def reverse_dns(ip: str) -> str:
-    """Reverse DNS lookup with timeout."""
+    Uses the stdlib rather than prefix regexes, which previously missed
+    fd00::/8 (the half of fc00::/7 actually in use), link-local, multicast
+    and carrier-grade NAT. Verified: is_private alone does NOT cover
+    100.64.0.0/10 on CPython 3.12, so that range is checked explicitly.
+    """
+    if not ip:
+        return False
     try:
-        return socket.gethostbyaddr(ip)[0]
-    except Exception:
+        addr = ip_address(str(ip).strip())
+    except ValueError:
+        return False
+    if addr.version == 4 and addr in _CGNAT4:
+        return True
+    return bool(
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_multicast
+        or addr.is_reserved
+        or addr.is_unspecified
+    )
+
+
+_rdns_lock = threading.Lock()
+
+
+def reverse_dns(ip: str, timeout: float = 1.5) -> str:
+    """Reverse DNS lookup bounded by `timeout` seconds.
+
+    Returns "" when the name cannot be resolved. The previous implementation
+    documented a timeout it did not have, so a slow PTR server stalled the
+    packet-render path for seconds at a time.
+    """
+    if not ip:
         return ""
+    with _rdns_lock:
+        previous = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(timeout)
+        try:
+            return socket.gethostbyaddr(ip)[0]
+        except (socket.herror, socket.gaierror, socket.timeout, OSError):
+            return ""
+        finally:
+            socket.setdefaulttimeout(previous)
 
 
 # ── String / Math ──────────────────────────────────────────────────────────────
@@ -263,7 +361,7 @@ def save_report_pdf(title: str, subtitle: str, sections: list[tuple[str, list[st
         c.setFont("Helvetica-Bold", 14)
         c.drawString(x + 10, top - 35, v[:30])
 
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    ts = utc_now().strftime("%Y-%m-%d %H:%M:%S UTC")
 
     # Extract key/value lines from sections for dashboard cards.
     kv_pairs: list[tuple[str, str]] = []
@@ -398,12 +496,77 @@ def save_report_pdf(title: str, subtitle: str, sections: list[tuple[str, list[st
 
 
 def now_str() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return utc_now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def timestamp_filename() -> str:
-    return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    return utc_now().strftime("%Y%m%d_%H%M%S")
 
 
 def md5(s: str) -> str:
     return hashlib.md5(s.encode()).hexdigest()[:8]
+
+
+# ── Timestamps ─────────────────────────────────────────────────────────────────
+
+def utc_now() -> datetime:
+    """Timezone-aware UTC now (datetime.utcnow() is deprecated in 3.12)."""
+    return datetime.now(timezone.utc)
+
+
+# ── Output safety ──────────────────────────────────────────────────────────────
+
+_UNSAFE_NAME = re.compile(r"[^a-z0-9._-]")
+
+
+def safe_slug(value: str, limit: int = 40) -> str:
+    """Reduce untrusted text to a filename-safe slug."""
+    slug = _UNSAFE_NAME.sub("_", str(value).lower()).strip("._-")
+    return slug[:limit] or "unnamed"
+
+
+def safe_output_path(base: str, prefix: str, untrusted: str, ext: str) -> Path:
+    """Build an output path from untrusted input that cannot escape `base`.
+
+    Network- and device-supplied strings (DNS names, USB serials) previously
+    reached filenames directly, so a name containing traversal segments could
+    write anywhere the process could reach. The slug removes separators, the
+    hash keeps distinct inputs distinct, and the containment check is the
+    backstop.
+    """
+    root = Path(base).resolve()
+    candidate = (root / f"{prefix}{safe_slug(untrusted)}_{md5(str(untrusted))}{ext}").resolve()
+    if not candidate.is_relative_to(root):
+        raise ValueError(f"refusing to write outside results directory: {untrusted!r}")
+    return candidate
+
+
+# ── Report safety ──────────────────────────────────────────────────────────────
+
+def h(value) -> str:
+    """HTML-escape a value for inclusion in a generated report.
+
+    Captured data (Host headers, User-Agents, DNS names, URLs) is attacker
+    controlled and lands in reports an analyst opens in a browser.
+    """
+    if value is None:
+        return ""
+    return _html_escape(str(value), quote=True)
+
+
+def shell_safe(value, limit: int = 200) -> str:
+    """Strip characters that could break out of a notification command string."""
+    return re.sub(r"[^A-Za-z0-9 .:/_@?=&+-]", "", str(value))[:limit]
+
+
+# ── Honest value rendering ─────────────────────────────────────────────────────
+
+def present(value, fallback: str = UNKNOWN) -> str:
+    """Render a value, or an explicit marker when there is nothing to show.
+
+    Report fields must never be filled with an invented placeholder.
+    """
+    if value is None:
+        return fallback
+    text = str(value).strip()
+    return text if text else fallback

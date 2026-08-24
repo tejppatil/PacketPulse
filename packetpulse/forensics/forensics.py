@@ -6,24 +6,34 @@ Branding: PacketPulse | Dreamwalker4u
 """
 from __future__ import annotations
 
-import re, json, socket, subprocess, threading, platform, hashlib, time
-from collections import defaultdict
-from datetime import datetime
+import hashlib
+import json
+import shutil
+import sys
+import types
+import platform
+import socket
+import subprocess
+import time
 from pathlib import Path
+from datetime import datetime
 from typing import Optional
 
 import psutil
-from rich.console import Console
-from rich.table import Table
-from rich import box
 
+from packetpulse import __version__
 from packetpulse.core.config import get_config
-from packetpulse.core.logger import get_logger
+from packetpulse.core.logger import get_logger, console as _shared_console
+from packetpulse.core import capabilities
+from packetpulse.core.session import Session, StopController, utc_now
 from packetpulse.utils.helpers import (
-    geoip_lookup, is_private_ip, save_json, ensure_dir, now_str, human_bytes, timestamp_filename, save_report_pdf
+    geoip_lookup, is_private_ip, save_json, ensure_dir, now_str, human_bytes,
+    timestamp_filename, save_report_pdf, safe_output_path, h as esc,
 )
 
-console = Console()
+console = _shared_console
+
+UNKNOWN_VALUE = "UNKNOWN"
 log = get_logger("forensics")
 
 # ── Device history (cross-session) ────────────────────────────────────────────
@@ -34,13 +44,15 @@ def _load_history():
     try:
         with open(_HIST_FILE) as f:
             _device_history.update(json.load(f))
-    except: pass
+    except Exception:
+        pass
 
 def _save_history():
     try:
         Path(_HIST_FILE).parent.mkdir(parents=True, exist_ok=True)
         with open(_HIST_FILE,"w") as f: json.dump(_device_history, f)
-    except: pass
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -53,7 +65,8 @@ def _mac_lookup(mac: str) -> str:
         p = manuf.MacParser()
         result = p.get_manuf(mac)
         if result: return result
-    except: pass
+    except Exception:
+        pass
     prefix = mac.upper().replace("-",":")[0:8]
     KNOWN = {
         "00:0C:29":"VMware","00:50:56":"VMware","08:00:27":"VirtualBox","52:54:00":"QEMU/KVM",
@@ -65,7 +78,7 @@ def _mac_lookup(mac: str) -> str:
         "00:21:CC":"Cisco","00:24:13":"Cisco","00:1B:2B":"Cisco",
         "D4:5D:64":"TP-Link","50:C7:BF":"TP-Link","00:0F:F7":"TP-Link",
         "80:CE:62":"Huawei","90:4E:2B":"Huawei","00:E0:4C":"Realtek",
-        "B8:27:EB":"Raspberry Pi","DC:A6:32":"Raspberry Pi",
+        
         "00:16:3E":"Xen","00:1B:44":"SanDisk","F0:18:98":"Xiaomi",
         "FC:F5:28":"Huawei","B0:A7:B9":"Intel","8C:8D:28":"Intel",
         "3C:D9:2B":"Hewlett Packard","38:63:BB":"HP",
@@ -85,26 +98,31 @@ OS_SIGNATURES = [
     (60, 64, 1024, 4096,"FreeBSD",75),(30,64,512,4096,"Network Device",72),
 ]
 
-def _fingerprint_os(ttl:int, window:int, vendor:str) -> tuple[str,int]:
-    v = vendor.lower()
-    if "apple"     in v: return "macOS / iOS",85
-    if "microsoft" in v: return "Windows",85
-    if "raspberry" in v: return "Linux (Raspberry Pi OS)",95
-    if "samsung"   in v or "xiaomi" in v: return "Android",80
-    if "vmware"    in v: return "Linux (VMware guest)",88
-    if "virtualbox"in v: return "Linux/Windows (VirtualBox)",80
-    if "cisco"     in v or "netgear" in v or "tp-link" in v: return "Network Equipment OS",75
-    for tmin,tmax,wmin,wmax,name,conf in OS_SIGNATURES:
-        if tmin<=ttl<=tmax and wmin<=window<=wmax: return name,conf
-    if ttl>=120: return "Windows",60
-    if ttl>=60:  return "Linux / Unix",60
-    if ttl>=30:  return "Network Device",55
-    return "Unknown",0
+def _fingerprint_os(ttl: int, window: int, vendor: str) -> dict:
+    """Coarse OS guess from TTL and TCP window size.
 
+    This is a weak heuristic: TTL is decremented by every hop and window sizes
+    overlap heavily between systems. The result is labelled as a heuristic with
+    its evidence, and returns UNKNOWN when there is nothing to go on — it is
+    never presented as an identification.
+    """
+    if not ttl:
+        return {"likely_os": UNKNOWN_VALUE, "basis": "no TTL observed",
+                "method": "none", "confidence": "none"}
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# LOCAL MACHINE PROFILE
-# ═══════════════════════════════════════════════════════════════════════════════
+    initial = 64 if ttl <= 64 else 128 if ttl <= 128 else 255
+    family = {64: "Linux/Unix/macOS", 128: "Windows", 255: "network device"}[initial]
+    hops = initial - ttl
+
+    return {
+        "likely_os": family,
+        "basis": "observed TTL {} implies initial TTL {} ({} hops away)".format(ttl, initial, hops),
+        "method": "TTL/window heuristic",
+        "confidence": "heuristic - not an identification",
+        "window_size": window or UNKNOWN_VALUE,
+        "vendor_hint": vendor or UNKNOWN_VALUE,
+    }
+
 
 def _profile_local_machine() -> dict:
     """Extract every possible data point about the machine running PacketPulse."""
@@ -129,7 +147,8 @@ def _profile_local_machine() -> dict:
         data["cpu_logical_cores"]  = psutil.cpu_count(logical=True)
         data["cpu_freq_mhz"]       = psutil.cpu_freq().current if psutil.cpu_freq() else None
         data["cpu_usage_pct"]      = psutil.cpu_percent(interval=0.5)
-    except: pass
+    except Exception:
+        pass
 
     # Memory
     try:
@@ -141,7 +160,8 @@ def _profile_local_machine() -> dict:
         swap = psutil.swap_memory()
         data["swap_total_gb"] = round(swap.total/1e9, 2)
         data["swap_used_gb"]  = round(swap.used/1e9, 2)
-    except: pass
+    except Exception:
+        pass
 
     # Disk
     try:
@@ -155,9 +175,11 @@ def _profile_local_machine() -> dict:
                     "used_gb": round(usage.used/1e9,2),"free_gb": round(usage.free/1e9,2),
                     "pct": usage.percent,
                 })
-            except: pass
+            except Exception:
+                pass
         data["disks"] = disks
-    except: pass
+    except Exception:
+        pass
 
     # Network interfaces
     try:
@@ -176,7 +198,8 @@ def _profile_local_machine() -> dict:
                 })
             ifaces.append(iface)
         data["network_interfaces"] = ifaces
-    except: pass
+    except Exception:
+        pass
 
     # Network counters
     try:
@@ -187,7 +210,8 @@ def _profile_local_machine() -> dict:
         data["net_packets_recv"] = nc.packets_recv
         data["net_errors_in"]    = nc.errin
         data["net_errors_out"]   = nc.errout
-    except: pass
+    except Exception:
+        pass
 
     # Open sockets
     try:
@@ -195,7 +219,8 @@ def _profile_local_machine() -> dict:
         for c in psutil.net_connections(kind="inet"):
             try:
                 proc_name = psutil.Process(c.pid).name() if c.pid else ""
-            except: proc_name = ""
+            except Exception:
+                proc_name = ""
             conns.append({
                 "family": str(c.family),"type": str(c.type),
                 "laddr": f"{c.laddr.ip}:{c.laddr.port}" if c.laddr else "",
@@ -203,7 +228,8 @@ def _profile_local_machine() -> dict:
                 "status": c.status,"pid": c.pid,"process": proc_name,
             })
         data["open_connections"] = conns[:100]
-    except: pass
+    except Exception:
+        pass
 
     # Listening ports
     try:
@@ -214,14 +240,15 @@ def _profile_local_machine() -> dict:
              "pid": c.pid,"process": psutil.Process(c.pid).name() if c.pid else ""}
             for c in listening
         ]
-    except: pass
+    except Exception:
+        pass
 
     # Processes with network activity
     try:
         net_procs = []
         for proc in psutil.process_iter(["pid","name","status","cpu_percent","memory_info"]):
             try:
-                conns = proc.connections(kind="inet")
+                conns = proc.net_connections(kind="inet")
                 if conns:
                     net_procs.append({
                         "pid":     proc.info["pid"],
@@ -231,39 +258,58 @@ def _profile_local_machine() -> dict:
                         "cpu_pct": proc.info["cpu_percent"],
                         "mem_mb":  round(proc.info["memory_info"].rss/1e6,2) if proc.info["memory_info"] else 0,
                     })
-            except: pass
+            except Exception:
+                pass
         data["network_processes"] = sorted(net_procs, key=lambda x:x["connections"], reverse=True)[:30]
-    except: pass
+    except Exception:
+        pass
 
     # ARP table
     try:
-        arp_out = subprocess.run(["arp","-n"],capture_output=True,text=True,timeout=5)
+        # BSD/Linux use -n; Windows arp.exe only understands -a.
+        arp_args = ["arp", "-a"] if sys.platform == "win32" else ["arp", "-n"]
+        arp_out_text, arp_status = _run_tool(arp_args)
+        data["arp_table_status"] = arp_status
+        arp_out = types.SimpleNamespace(stdout=arp_out_text)
         data["arp_table_raw"] = arp_out.stdout[:2000]
-    except: pass
+    except Exception:
+        pass
 
     # Routing table
     try:
-        route_out = subprocess.run(["ip","route"],capture_output=True,text=True,timeout=5)
+        route_cmd = ["route", "print"] if sys.platform == "win32" else ["ip", "route"]
+        route_text, route_status = _run_tool(route_cmd)
+        data["routing_table_status"] = route_status
+        route_out = types.SimpleNamespace(stdout=route_text)
         data["routing_table_raw"] = route_out.stdout[:2000]
-    except:
+    except Exception:
         try:
-            r = subprocess.run(["netstat","-rn"],capture_output=True,text=True,timeout=5)
+            netstat_text, netstat_status = _run_tool(["netstat", "-rn"])
+            data["routing_table_status"] = netstat_status
+            r = types.SimpleNamespace(stdout=netstat_text)
             data["routing_table_raw"] = r.stdout[:2000]
-        except: pass
+        except Exception:
+            pass
 
     # DNS cache (systemd-resolved)
     try:
-        dns_out = subprocess.run(["resolvectl","statistics"],capture_output=True,text=True,timeout=5)
+        dns_text, dns_status = _run_tool(["resolvectl", "statistics"])
+        data["resolver_stats_status"] = dns_status
+        dns_out = types.SimpleNamespace(stdout=dns_text)
         data["dns_resolver_stats"] = dns_out.stdout[:1000]
-    except: pass
+    except Exception:
+        pass
 
     # USB history (from kernel logs)
     try:
-        dmesg = subprocess.run(["dmesg","--notime"],capture_output=True,text=True,timeout=5)
+        dmesg_text, dmesg_status = _run_tool(["dmesg", "--notime"])
+        data["kernel_log_status"] = dmesg_status
+        dmesg = types.SimpleNamespace(stdout=dmesg_text)
         usb_lines = [l for l in dmesg.stdout.splitlines() if "usb" in l.lower() and
                      any(k in l.lower() for k in ["new","disconnect","product","manufacturer","serial"])]
         data["usb_kernel_history"] = usb_lines[-30:]
-    except: pass
+    except Exception:
+        pass
 
     return data
 
@@ -282,7 +328,8 @@ def _get_usb_blkid(device: str) -> dict:
             if "=" in line:
                 k,_,v = line.partition("=")
                 info[k.lower()] = v
-    except: pass
+    except Exception:
+        pass
     return info
 
 def _get_usb_lsusb_detail(vid: str, pid: str) -> dict:
@@ -300,7 +347,8 @@ def _get_usb_lsusb_detail(vid: str, pid: str) -> dict:
                     parts = line.split(None,2)
                     if len(parts) >= 2:
                         detail[key] = parts[-1].strip()
-    except: pass
+    except Exception:
+        pass
     return detail
 
 def _platform_from_device(vid:str, pid:str, product:str, manufacturer:str) -> str:
@@ -358,195 +406,314 @@ def _get_storage_detail(product:str) -> Optional[dict]:
             }
             if best is None or usage.total > best.get("total_bytes",0):
                 best = d
-        except: pass
+        except Exception:
+            pass
     return best
 
-def _scan_usb_devices() -> list[dict]:
-    devices = []
-    _load_history()
+def _usb_storage_detail(ctx, usb_dev) -> dict:
+    """Filesystem detail for the block devices belonging to a USB device.
+
+    Returns a dict describing what was OBSERVED, or an explicit status when the
+    device has no block children (keyboards, hubs, dongles) or when the tools
+    needed to inspect them are absent.
+    """
+    result = {"status": "NOT APPLICABLE",
+              "reason": "device exposes no block devices",
+              "partitions": []}
+    try:
+        children = list(ctx.list_devices(subsystem="block").match_parent(usb_dev))
+    except Exception as e:
+        return {"status": "UNAVAILABLE",
+                "reason": "could not enumerate block devices: {}".format(type(e).__name__),
+                "partitions": []}
+
+    if not children:
+        return result
+
+    have_blkid = capabilities.probe_all()["blkid"].available
+    partitions = []
+    for blk in children:
+        node = blk.device_node
+        if not node:
+            continue
+        part = {
+            "device": node,
+            "type": blk.get("DEVTYPE") or UNKNOWN_VALUE,
+            "size_bytes": UNKNOWN_VALUE,
+            "filesystem": UNKNOWN_VALUE,
+            "label": UNKNOWN_VALUE,
+            "uuid": UNKNOWN_VALUE,
+            "mountpoint": UNKNOWN_VALUE,
+        }
+        try:
+            sectors = blk.attributes.asstring("size")
+            part["size_bytes"] = int(sectors) * 512     # sysfs reports 512B sectors
+        except Exception:
+            pass
+
+        # udev already carries filesystem properties for most media.
+        for key, prop in (("filesystem", "ID_FS_TYPE"), ("label", "ID_FS_LABEL"),
+                          ("uuid", "ID_FS_UUID")):
+            value = blk.get(prop)
+            if value:
+                part[key] = value
+
+        if have_blkid and part["filesystem"] == UNKNOWN_VALUE:
+            info = _get_usb_blkid(node)
+            for key, src in (("filesystem", "TYPE"), ("label", "LABEL"), ("uuid", "UUID")):
+                if info.get(src):
+                    part[key] = info[src]
+
+        part["mountpoint"] = _mountpoint_for(node)
+        partitions.append(part)
+
+    return {"status": "OBSERVED" if partitions else "NOT APPLICABLE",
+            "reason": "" if partitions else "no usable block devices",
+            "partitions": partitions}
+
+
+def _mountpoint_for(device_node: str) -> str:
+    """Where a block device is mounted, from the kernel's own mount table."""
+    try:
+        with open("/proc/self/mounts", "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == device_node:
+                    return parts[1].replace(chr(92) + "040", " ")
+    except OSError:
+        return UNKNOWN_VALUE
+    return "not mounted"
+
+
+def _scan_usb_devices(session=None) -> tuple:
+    """Enumerate USB devices via pyudev.
+
+    Returns (devices, unavailable_reason). When the dependency or platform is
+    missing the reason is returned so the caller can report UNAVAILABLE — an
+    empty list must never be presented as a successful scan that found nothing.
+    """
+    cap = capabilities.probe_all()["usb"]
+    if not cap.available:
+        return [], cap.reason
+
     try:
         import pyudev
-        context = pyudev.Context()
-        for dev in context.list_devices(subsystem="usb", DEVTYPE="usb_device"):
+    except ImportError as e:
+        return [], "pyudev import failed: {}".format(e)
+
+    devices = []
+    try:
+        ctx = pyudev.Context()
+        for dev in ctx.list_devices(subsystem="usb", DEVTYPE="usb_device"):
             try:
-                vid      = (dev.get("ID_VENDOR_ID") or "").lower()
-                pid      = (dev.get("ID_MODEL_ID") or "").lower()
-                product  = (dev.get("ID_MODEL") or dev.get("ID_MODEL_FROM_DATABASE") or "").replace("_"," ").strip()
-                manuf    = (dev.get("ID_VENDOR") or dev.get("ID_VENDOR_FROM_DATABASE") or "").replace("_"," ").strip()
-                serial   = dev.get("ID_SERIAL_SHORT") or dev.get("ID_SERIAL") or ""
-                bus      = dev.get("BUSNUM") or ""
-                devnum   = dev.get("DEVNUM") or ""
-                devpath  = dev.get("DEVPATH") or ""
-                devnode  = dev.get("DEVNAME") or ""
-
-                if not product and not manuf: continue
-
-                # Speed
-                speed_raw = ""
-                try: speed_raw = dev.attributes.asstring("speed") if dev.attributes.available_attributes else ""
-                except: pass
-                speed_map = {"1.5":"USB 1.1 (Low Speed — 1.5 Mbps)","12":"USB 1.1 (Full Speed — 12 Mbps)",
-                             "480":"USB 2.0 (High Speed — 480 Mbps)","5000":"USB 3.0 (SuperSpeed — 5 Gbps)",
-                             "10000":"USB 3.1 Gen2 (10 Gbps)","20000":"USB 3.2 Gen2x2 (20 Gbps)"}
-                speed_str = speed_map.get(speed_raw.strip(), f"USB ({speed_raw} Mbps)" if speed_raw else "Unknown")
-
-                # Power
-                power_raw = ""
-                try: power_raw = dev.attributes.asstring("bMaxPower") if dev.attributes.available_attributes else ""
-                except: pass
-
-                # Device class
-                dev_class = (dev.get("ID_USB_CLASS_FROM_DATABASE") or
-                             dev.get("DRIVER") or
-                             dev.attributes.asstring("bDeviceClass") if hasattr(dev,"attributes") else "Unknown")
-                try: dev_class = dev_class or "Unknown"
-                except: dev_class = "Unknown"
-
-                driver   = dev.get("DRIVER") or ""
-                seen     = _device_history.get(serial, 0)
-                _device_history[serial] = seen + 1
-                _save_history()
-
-                lsusb_detail = _get_usb_lsusb_detail(vid, pid)
-                os_platform  = _platform_from_device(vid, pid, product, manuf)
-                device_type  = _classify_usb(dev_class, product, manuf)
-                risk         = "NEW_DEVICE" if seen == 0 else "KNOWN"
-
-                # Hash for fingerprint
-                fingerprint = hashlib.sha256(f"{vid}{pid}{serial}".encode()).hexdigest()[:16]
-
-                d = {
-                    "type":          "usb_device",
-                    "timestamp":     now_str(),
-                    "product":       product or "Unknown Device",
-                    "manufacturer":  manuf,
-                    "serial_number": serial,
-                    "vid":           vid,
-                    "pid":           pid,
-                    "vid_pid_str":   f"VID_{vid.upper()}&PID_{pid.upper()}",
-                    "bus":           bus,
-                    "port":          devnum,
-                    "devpath":       devpath,
-                    "devnode":       devnode,
-                    "speed":         speed_str,
-                    "max_power_ma":  power_raw,
-                    "device_class":  dev_class,
-                    "device_type":   device_type,
-                    "driver":        driver,
-                    "os_platform":   os_platform,
-                    "lsusb_detail":  lsusb_detail,
-                    "fingerprint":   fingerprint,
-                    "times_seen":    seen,
-                    "first_seen":    "THIS SESSION" if seen == 0 else f"SESSION #{seen+1}",
-                    "risk":          risk,
-                    "connected_at":  now_str(),
+                vid = dev.get("ID_VENDOR_ID", "") or ""
+                pid = dev.get("ID_MODEL_ID", "") or ""
+                product = (dev.get("ID_MODEL") or "").replace("_", " ")
+                manuf = (dev.get("ID_VENDOR") or "").replace("_", " ")
+                serial = dev.get("ID_SERIAL_SHORT") or ""
+                entry = {
+                    "source": "pyudev (OBSERVED)",
+                    "product": product or UNKNOWN_VALUE,
+                    "manufacturer": manuf or UNKNOWN_VALUE,
+                    "serial_number": serial or UNKNOWN_VALUE,
+                    "vendor_id": vid or UNKNOWN_VALUE,
+                    "product_id": pid or UNKNOWN_VALUE,
+                    "device_node": dev.device_node or UNKNOWN_VALUE,
+                    "driver": dev.driver or UNKNOWN_VALUE,
+                    "sys_path": dev.sys_path or UNKNOWN_VALUE,
+                    "speed": dev.attributes.asstring("speed") if dev.attributes.get("speed") else UNKNOWN_VALUE,
+                    "max_power": dev.attributes.asstring("bMaxPower") if dev.attributes.get("bMaxPower") else UNKNOWN_VALUE,
                 }
-
-                # Storage details
-                if any(k in device_type.lower() for k in ["storage","mass"]):
-                    storage = _get_storage_detail(product)
-                    if storage: d["storage"] = storage
-
-                devices.append(d)
-            except Exception as e:
-                log.debug(f"USB parse error: {e}")
-    except ImportError:
-        console.print("  [yellow]pyudev not available — USB requires Linux + pyudev[/yellow]")
+                seen = _device_history.get(serial, 0) if serial else 0
+                entry["previously_seen_count"] = seen
+                entry["first_time_seen"] = (seen == 0)
+                if serial:
+                    _device_history[serial] = seen + 1
+                # Storage detail comes from the BLOCK devices belonging to this
+                # USB device, not from its own device node: a usb_device node is
+                # /dev/bus/usb/BBB/DDD (the control endpoint), which carries no
+                # filesystem, so blkid on it always returned nothing.
+                entry["storage"] = _usb_storage_detail(ctx, dev)
+                devices.append(entry)
+            except (OSError, KeyError, AttributeError) as e:
+                log.warning("could not read USB device: %s: %s", type(e).__name__, e)
+                if session is not None:
+                    session.record_error("usb_device_read", e)
+        _save_history()
     except Exception as e:
-        console.print(f"  [yellow]USB scan error: {e}[/yellow]")
+        return [], "pyudev enumeration failed: {}: {}".format(type(e).__name__, e)
 
-    # Fallback: lsusb parsing
-    if not devices:
-        try:
-            r = subprocess.run(["lsusb"],capture_output=True,text=True,timeout=5)
-            for line in r.stdout.splitlines():
-                m = re.match(r"Bus (\d+) Device (\d+): ID ([0-9a-f]{4}):([0-9a-f]{4}) (.+)", line)
-                if m:
-                    devices.append({
-                        "type":"usb_device","timestamp":now_str(),
-                        "bus":m.group(1),"port":m.group(2),
-                        "vid":m.group(3),"pid":m.group(4),
-                        "product":m.group(5).strip(),"manufacturer":"",
-                        "serial_number":"","speed":"Unknown","max_power_ma":"Unknown",
-                        "device_class":"Unknown","device_type":"USB Device",
-                        "driver":"","os_platform":"","times_seen":0,"risk":"UNKNOWN",
-                    })
-        except: pass
+    return devices, ""
 
-    return devices
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# LAN DEVICE PROFILING
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def _arp_scan(subnet: Optional[str] = None) -> list[dict]:
     try:
-        from scapy.all import ARP, Ether, srp
+        from scapy.layers.l2 import ARP, Ether
+        from scapy.sendrecv import srp
         if not subnet:
-            for iface, addrs in psutil.net_if_addrs().items():
-                for addr in addrs:
-                    if addr.family == socket.AF_INET and not addr.address.startswith("127."):
-                        parts = addr.address.split(".")
-                        subnet = f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+            # Use the address the OS actually routes from, not the first
+            # non-loopback address found: that picked APIPA/link-local
+            # (169.254.x) addresses and scanned a subnet with no hosts on it.
+            route_ip = ""
+            try:
+                sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    sk.connect(("8.8.8.8", 53))
+                    route_ip = sk.getsockname()[0]
+                finally:
+                    sk.close()
+            except OSError:
+                route_ip = ""
+            if route_ip and not route_ip.startswith(("127.", "169.254.")):
+                parts = route_ip.split(".")
+                subnet = "{}.{}.{}.0/24".format(parts[0], parts[1], parts[2])
+            else:
+                for iface, addrs in psutil.net_if_addrs().items():
+                    for addr in addrs:
+                        if (addr.family == socket.AF_INET
+                                and not addr.address.startswith(("127.", "169.254."))):
+                            parts = addr.address.split(".")
+                            subnet = "{}.{}.{}.0/24".format(parts[0], parts[1], parts[2])
+                            break
+                    if subnet:
                         break
-                if subnet: break
-        if not subnet: return []
+        if not subnet:
+            log.warning("no usable IPv4 subnet found for ARP scan")
+            return []
         console.print(f"  [dim]ARP scanning[/dim] [cyan]{subnet}[/cyan] [dim]...[/dim]")
         answered,_ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=subnet),timeout=3,verbose=False)
         return [{"ip":rcv[ARP].psrc,"mac":rcv[Ether].src} for _,rcv in answered]
     except Exception as e:
         log.debug(f"ARP scan error: {e}"); return []
 
-def _get_hostname(ip: str) -> dict:
-    """Try all hostname resolution methods."""
-    result = {"rdns":"","netbios":"","mdns":""}
-    try: result["rdns"] = socket.gethostbyaddr(ip)[0]
-    except: pass
+def _run_tool(args, timeout=5):
+    """Run an external tool and report what happened.
+
+    Returns (stdout, status) where status is "OBSERVED" or an explicit reason.
+    Several of these tools are absent by default on current distributions —
+    `arp` moved to the optional net-tools package, `dmesg` is root-restricted
+    under kernel.dmesg_restrict, `resolvectl` needs systemd-resolved — and
+    swallowing that silently produced empty sections that looked like findings
+    of "nothing".
+    """
+    tool = args[0]
+    if not shutil.which(tool):
+        return "", "UNAVAILABLE: {} is not installed".format(tool)
     try:
-        r = subprocess.run(["nmblookup","-A",ip],capture_output=True,text=True,timeout=3)
-        for line in r.stdout.splitlines():
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "", "UNAVAILABLE: {} timed out after {}s".format(tool, timeout)
+    except (OSError, ValueError) as e:
+        return "", "UNAVAILABLE: {} failed ({})".format(tool, type(e).__name__)
+    if r.returncode != 0:
+        detail = (r.stderr or "").strip().splitlines()
+        why = detail[0][:90] if detail else "exit code {}".format(r.returncode)
+        return r.stdout or "", "UNAVAILABLE: {} -> {}".format(tool, why)
+    return r.stdout or "", "OBSERVED"
+
+
+def _get_hostname(ip: str) -> dict:
+    """Resolve a host name by every available method, reporting each outcome.
+
+    A blank name previously meant either "no name exists" or "the tool that
+    would have found it is not installed". Those are different facts, so each
+    method now carries its own status.
+    """
+    result = {"rdns": "", "netbios": "", "mdns": "", "methods": {}}
+
+    try:
+        result["rdns"] = socket.gethostbyaddr(ip)[0]
+        result["methods"]["reverse_dns"] = "OBSERVED"
+    except (socket.herror, socket.gaierror, OSError):
+        result["methods"]["reverse_dns"] = "NOT RESOLVED"
+
+    out, status = _run_tool(["nmblookup", "-A", ip], timeout=3)
+    result["methods"]["netbios"] = status
+    if status == "OBSERVED":
+        for line in out.splitlines():
             if "<00>" in line and "GROUP" not in line:
                 name = line.strip().split()[0]
-                if name and name != ip: result["netbios"] = name + " (NetBIOS)"
-    except: pass
-    try:
-        r = subprocess.run(["avahi-resolve","-a",ip],capture_output=True,text=True,timeout=3)
-        if r.stdout.strip(): result["mdns"] = r.stdout.strip().split()[-1] + " (mDNS)"
-    except: pass
+                if name and name != ip:
+                    result["netbios"] = name
+                    break
+        if not result["netbios"]:
+            result["methods"]["netbios"] = "NOT RESOLVED"
+
+    out, status = _run_tool(["avahi-resolve", "-a", ip], timeout=3)
+    result["methods"]["mdns"] = status
+    if status == "OBSERVED":
+        if out.strip():
+            result["mdns"] = out.strip().split()[-1]
+        else:
+            result["methods"]["mdns"] = "NOT RESOLVED"
+
     return result
 
-def _nmap_scan(ip: str) -> dict:
-    result = {"open_ports":[],"os_guess":"","os_confidence":0,"services":{},"scan_type":""}
+
+def _nmap_scan(ip: str, timeout: int = 180) -> dict:
+    """Active port scan of one host.
+
+    Verifies that both the binding and the nmap binary exist before running,
+    bounds the scan, and reports failure explicitly. It never returns invented
+    ports or services.
+    """
+    result = {
+        "status": "NOT RUN",
+        "open_ports": [],
+        "services": {},
+        "os_guess": None,
+        "os_evidence": None,
+        "scan_type": None,
+    }
+    cap = capabilities.probe_all()["nmap"]
+    if not cap.available:
+        result["status"] = "UNAVAILABLE"
+        result["reason"] = cap.reason
+        return result
+
     try:
         import nmap
+
         nm = nmap.PortScanner()
-        nm.scan(hosts=ip, arguments="-sS -sV -O --top-ports 200 -T4 --open --version-intensity 5")
-        if ip in nm.all_hosts():
-            host = nm[ip]
-            for proto in host.all_protocols():
-                for port in sorted(host[proto].keys()):
-                    pd = host[proto][port]
-                    if pd["state"] == "open":
-                        result["open_ports"].append(port)
-                        result["services"][str(port)] = {
-                            "protocol":  proto,
-                            "service":   pd.get("name",""),
-                            "version":   pd.get("version",""),
-                            "product":   pd.get("product",""),
-                            "extrainfo": pd.get("extrainfo",""),
-                            "cpe":       pd.get("cpe",""),
-                            "state":     "open",
-                        }
-            if "osmatch" in host and host["osmatch"]:
-                best = host["osmatch"][0]
-                result["os_guess"]      = best.get("name","")
-                result["os_confidence"] = int(best.get("accuracy",0))
-            result["scan_type"] = "nmap -sS -sV -O"
+        args = "-sT -sV --top-ports 100 -T4 --open --host-timeout {}s".format(timeout)
+        if capabilities.is_admin():
+            # SYN scan and OS detection both require raw sockets.
+            args = "-sS -sV -O --top-ports 200 -T4 --open --host-timeout {}s".format(timeout)
+        nm.scan(hosts=ip, arguments=args)
+        result["scan_type"] = "nmap {}".format(args)
+
+        if ip not in nm.all_hosts():
+            result["status"] = "COMPLETED"
+            result["note"] = "host did not respond to the scan"
+            return result
+
+        host = nm[ip]
+        for proto in host.all_protocols():
+            for port in sorted(host[proto].keys()):
+                pd = host[proto][port]
+                if pd.get("state") != "open":
+                    continue
+                result["open_ports"].append(port)
+                result["services"][str(port)] = {
+                    "protocol": proto,
+                    "service": pd.get("name") or UNKNOWN_VALUE,
+                    "product": pd.get("product") or UNKNOWN_VALUE,
+                    "version": pd.get("version") or UNKNOWN_VALUE,
+                    "state": "open",
+                }
+        osmatch = host.get("osmatch") if hasattr(host, "get") else None
+        if osmatch:
+            best = osmatch[0]
+            result["os_guess"] = best.get("name") or UNKNOWN_VALUE
+            result["os_evidence"] = "nmap OS fingerprint, accuracy {}%".format(
+                best.get("accuracy", "?"))
+        result["status"] = "COMPLETED"
     except Exception as e:
-        log.debug(f"nmap error for {ip}: {e}")
-        result["error"] = str(e)
+        result["status"] = "FAILED"
+        result["reason"] = "{}: {}".format(type(e).__name__, str(e)[:160])
+        log.warning("nmap scan of %s failed: %s", ip, e)
     return result
+
 
 def _get_traffic_stats(ip: str) -> dict:
     stats = {"active_connections":[],"bytes_sent":0,"bytes_recv":0}
@@ -555,7 +722,8 @@ def _get_traffic_stats(ip: str) -> dict:
             if c.raddr and c.raddr.ip == ip:
                 proc = ""
                 try: proc = psutil.Process(c.pid).name() if c.pid else ""
-                except: pass
+                except Exception:
+                    pass
                 stats["active_connections"].append({
                     "local_port":  c.laddr.port if c.laddr else "",
                     "remote_port": c.raddr.port,
@@ -563,12 +731,14 @@ def _get_traffic_stats(ip: str) -> dict:
                     "pid":         c.pid,
                     "process":     proc,
                 })
-    except: pass
+    except Exception:
+        pass
     return stats
 
 def _classify_device(vendor: str, hostname_data: dict, open_ports: list) -> str:
     v = vendor.lower()
-    h = " ".join(hostname_data.values()).lower()
+    h = " ".join(str(v) for k, v in hostname_data.items()
+                 if k != "methods").lower()
     if "apple"     in v: return "Apple Device"
     if "raspberry" in v: return "Raspberry Pi / IoT Linux"
     if "vmware"    in v or "virtualbox" in v: return "Virtual Machine"
@@ -606,7 +776,8 @@ def _assess_lan_risk(open_ports: list, vendor: str) -> tuple[str, list[str]]:
 def _profile_lan_device(ip: str, mac: str, cfg, subnet: str = "") -> dict:
     vendor        = _mac_lookup(mac)
     hostname_data = _get_hostname(ip)
-    hostname      = hostname_data["rdns"] or hostname_data["netbios"] or hostname_data["mdns"] or ""
+    hostname      = (hostname_data["rdns"] or hostname_data["netbios"]
+                     or hostname_data["mdns"] or "")
 
     nmap_data: dict = {}
     if cfg.nmap_enabled:
@@ -640,6 +811,7 @@ def _profile_lan_device(ip: str, mac: str, cfg, subnet: str = "") -> dict:
         "hostname_rdns":  hostname_data["rdns"],
         "hostname_netbios":hostname_data["netbios"],
         "hostname_mdns":  hostname_data["mdns"],
+        "hostname_methods": hostname_data.get("methods", {}),
         "device_type":    d_type,
         "os_guess":       os_guess,
         "os_confidence":  os_conf,
@@ -664,6 +836,18 @@ def _profile_lan_device(ip: str, mac: str, cfg, subnet: str = "") -> dict:
 def _row(k:str,v:str,vc:str="white")->None:
     console.print(f"  [dim]{k:<24}[/dim] [{vc}]{v}[/{vc}]")
 
+def _usb_storage_line(dev: dict) -> str:
+    st = dev.get("storage") or {}
+    parts = st.get("partitions") or []
+    if st.get("status") == "OBSERVED" and parts:
+        first = parts[0]
+        return "{} {} on {} ({})".format(
+            first.get("device", UNKNOWN_VALUE), first.get("filesystem", UNKNOWN_VALUE),
+            first.get("mountpoint", UNKNOWN_VALUE), first.get("type", UNKNOWN_VALUE))
+    return "{}{}".format(st.get("status", UNKNOWN_VALUE),
+                         " - " + st["reason"] if st.get("reason") else "")
+
+
 def _print_usb(dev: dict) -> None:
     risk = dev.get("risk","OK")
     rc   = {"NEW_DEVICE":"bold red","KNOWN":"green","UNKNOWN":"yellow"}.get(risk,"white")
@@ -683,10 +867,10 @@ def _print_usb(dev: dict) -> None:
     _row("Device Node",     dev.get("devnode",""),"dim")
     _row("Fingerprint",     dev.get("fingerprint",""),"dim")
     seen = dev.get("times_seen",0)
-    _row("Session History", f"FIRST TIME — NEW DEVICE" if seen==0 else f"Seen {seen+1} times","red" if seen==0 else "dim")
+    _row("Session History", "FIRST TIME — NEW DEVICE" if seen==0 else f"Seen {seen+1} times","red" if seen==0 else "dim")
     s = dev.get("storage")
     if s:
-        console.print(f"\n  [dim]Storage Details:[/dim]")
+        console.print("\n  [dim]Storage Details:[/dim]")
         _row("  Label",       s.get("label",""),"cyan")
         _row("  Filesystem",  s.get("fstype",""))
         _row("  UUID",        s.get("uuid",""),"dim")
@@ -716,10 +900,10 @@ def _print_lan(dev: dict) -> None:
             risk_p = " [red]← DANGEROUS[/red]" if port in (4444,1337,31337,23,2323) else " [yellow]← EXPOSED[/yellow]" if port in (22,3389,445,139,3306,5432) else ""
             console.print(f"  [dim]  {port:<6}[/dim]  [green]OPEN[/green]  [cyan]{s:<12}[/cyan]  [dim]{pr} {v}[/dim]{risk_p}")
     if dev.get("risk_findings"):
-        console.print(f"\n  [bold red]Risk Findings:[/bold red]")
+        console.print("\n  [bold red]Risk Findings:[/bold red]")
         for f in dev["risk_findings"]: console.print(f"  [red]  ✗  {f}[/red]")
     if dev.get("traffic",{}).get("active_connections"):
-        console.print(f"\n  [dim]Active Connections:[/dim]")
+        console.print("\n  [dim]Active Connections:[/dim]")
         for c in dev["traffic"]["active_connections"][:8]:
             console.print(f"  [dim]  :{c.get('local_port','')} → :{c.get('remote_port','')}[/dim]  [yellow]{c.get('status','')}[/yellow]  [dim]{c.get('process','')}({c.get('pid','')})[/dim]")
     console.print()
@@ -736,7 +920,7 @@ def _generate_enject_report(data: dict, save_path: str) -> str:
         "__meta": {
             "tool":      "PacketPulse",
             "author":    "Dreamwalker4u",
-            "version":   "1.0.2",
+            "version":   __version__,
             "format":    "enject-forensics-v1",
             "generated": now_str(),
             "platform":  platform.system(),
@@ -764,7 +948,7 @@ def _generate_enject_report(data: dict, save_path: str) -> str:
 
 
 def _generate_forensics_report(data: dict, save_path: str) -> str:
-    ts_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    ts_str = utc_now().strftime("%Y-%m-%d %H:%M:%S UTC")
     usb_devices = data.get("usb_devices", [])
     lan_devices = data.get("lan_devices", [])
     local = data.get("local_machine", {})
@@ -789,7 +973,6 @@ def _generate_forensics_report(data: dict, save_path: str) -> str:
 
     lan_rows = "".join(device_row(dev) for dev in lan_devices[:30]) or "<tr><td colspan='5' class='dim'>No LAN devices profiled</td></tr>"
     critical_count = len([d for d in lan_devices if d.get('risk') == 'CRITICAL'])
-    high_count = len([d for d in lan_devices if d.get('risk') == 'HIGH'])
     new_usb_count = len([d for d in usb_devices if d.get('risk') == 'NEW_DEVICE'])
 
     html = f"""<!DOCTYPE html>
@@ -888,141 +1071,205 @@ td{{color:#e4e8ff}}
 # ENTRY POINTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_forensics(subnet:Optional[str]=None, no_nmap:bool=False) -> None:
+def run_forensics(subnet=None, no_nmap: bool = False, stop=None, session=None):
+    """Profile this host, its USB devices and the local network.
+
+    Every section is reported as OBSERVED, INFERRED or UNAVAILABLE. A section
+    that could not run says why; it never appears as an empty success.
+    """
+    stop = stop or StopController()
     cfg = get_config().forensics
-    if no_nmap: cfg.nmap_enabled = False
+    if no_nmap:
+        cfg.nmap_enabled = False
+    session = session or Session(module="forensics", interface=str(subnet or "auto"))
+
+    caps = capabilities.probe_all()
     ensure_dir(cfg.results_path)
     _load_history()
 
-    console.rule("[bold green]PACKETPULSE — DEVICE FORENSICS[/bold green]")
-    console.print(
-        f"  [dim]USB:[/dim] [green]{'ON' if cfg.usb_enabled else 'OFF'}[/green]   "
-        f"[dim]LAN:[/dim] [green]{'ON' if cfg.lan_enabled else 'OFF'}[/green]   "
-        f"[dim]nmap:[/dim] [green]{'ACTIVE SCAN' if cfg.nmap_enabled else 'PASSIVE ONLY'}[/green]"
-    )
-    console.print("  [dim]Output format: enject-forensics JSON + terminal display[/dim]")
-    console.print("[dim]"+"─"*100+"[/dim]\n")
+    console.rule("[bold green]PACKETPULSE - DEVICE FORENSICS[/bold green]")
+    console.print("  [dim]Session:[/dim] [cyan]{}[/cyan]  [dim]Host:[/dim] [green]{}[/green]".format(
+        session.session_id, platform.system()))
+    console.print("\n  [bold]Capabilities on this host[/bold]")
+    for line in capabilities.describe():
+        console.print("  " + line)
+    console.print()
 
-    session_data: dict = {
-        "timestamp":  now_str(),
-        "scan_type":  "full",
-        "usb_devices":[],
-        "lan_devices":[],
-        "local_machine":{},
+    session.note_limitation(
+        "OS fingerprinting from TTL/window size is a heuristic, not an identification.")
+    session.note_limitation(
+        "Only devices and hosts the OS actually reports are listed; nothing is inferred "
+        "into existence.")
+
+    data = {
+        "session": None,
+        "host": {},
+        "usb": {"status": "NOT RUN", "devices": []},
+        "lan": {"status": "NOT RUN", "devices": []},
     }
 
-    # ── Local machine profile ─────────────────────────────────────────────────
-    console.print("  [bold cyan][ LOCAL MACHINE ][/bold cyan]")
-    console.print("  [dim]Profiling local system...[/dim]")
-    local = _profile_local_machine()
-    session_data["local_machine"] = local
-    console.print(
-        f"  [dim]Hostname    :[/dim] [green]{local.get('hostname','')}[/green]  "
-        f"[dim]OS:[/dim] [green]{local.get('os','')} {local.get('os_release','')}[/green]  "
-        f"[dim]CPU:[/dim] [green]{local.get('cpu_logical_cores','')} cores @ {local.get('cpu_freq_mhz',0):.0f} MHz[/green]"
-    )
-    console.print(
-        f"  [dim]RAM         :[/dim] [green]{local.get('memory_total_gb','')} GB[/green]  "
-        f"[dim]Used:[/dim] [yellow]{local.get('memory_pct','')}%[/yellow]"
-    )
-    console.print(
-        f"  [dim]Open conns  :[/dim] [green]{len(local.get('open_connections',[]))}[/green]  "
-        f"[dim]Listening ports:[/dim] [green]{len(local.get('listening_ports',[]))}[/green]  "
-        f"[dim]Net processes:[/dim] [green]{len(local.get('network_processes',[]))}[/green]"
-    )
-    lm_path = f"{cfg.results_path}/local_machine_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
-    save_json(local, lm_path)
-    console.print(f"  [dim]Local profile →[/dim] [cyan]{lm_path}[/cyan]\n")
+    # ── LOCAL HOST (always observable) ──────────────────────────────────────
+    console.print("  [bold cyan][ LOCAL HOST ][/bold cyan]  [dim]source: OS APIs (OBSERVED)[/dim]")
+    try:
+        local = _profile_local_machine()
+        data["host"] = local
+        console.print("  Hostname      : [green]{}[/green]".format(esc(local.get("hostname", UNKNOWN_VALUE))))
+        console.print("  OS            : [green]{} {}[/green]".format(
+            esc(local.get("os", UNKNOWN_VALUE)), esc(local.get("os_release", ""))))
+        console.print("  Open sockets  : [green]{}[/green]   Listening: [green]{}[/green]".format(
+            len(local.get("open_connections", [])), len(local.get("listening_ports", []))))
+        session.count("host_open_connections", len(local.get("open_connections", [])))
+        session.count("host_listening_ports", len(local.get("listening_ports", [])))
+    except Exception as e:
+        session.record_error("local_profile", e)
+        console.print("  [red]Local host profiling FAILED:[/red] {}".format(e))
 
-    # ── USB ───────────────────────────────────────────────────────────────────
+    # ── USB ─────────────────────────────────────────────────────────────────
     if cfg.usb_enabled:
-        console.print("  [bold cyan][ USB DEVICES ][/bold cyan]")
-        usb_devices = _scan_usb_devices()
-        if usb_devices:
-            session_data["usb_devices"] = usb_devices
-            for dev in usb_devices:
-                _print_usb(dev)
-                p = f"{cfg.results_path}/usb_{(dev.get('serial_number') or dev.get('product','unknown')).replace('/','_')[:40]}.json"
-                save_json(dev, p)
-                console.print(f"  [dim]Saved →[/dim] [cyan]{p}[/cyan]")
+        console.print("\n  [bold cyan][ USB DEVICES ][/bold cyan]")
+        devices, reason = _scan_usb_devices(session)
+        if reason:
+            data["usb"] = {"status": "UNAVAILABLE", "reason": reason, "devices": []}
+            session.record_unavailable("USB forensics", reason)
+            console.print("  [yellow]USB Forensics: UNAVAILABLE[/yellow]")
+            console.print("  [dim]Reason: {}[/dim]".format(esc(reason)))
         else:
-            console.print("  [dim]No USB devices found (or pyudev unavailable).[/dim]\n")
+            data["usb"] = {"status": "OBSERVED", "devices": devices}
+            session.count("usb_devices", len(devices))
+            if devices:
+                for dev in devices:
+                    _print_usb(dev)
+                    try:
+                        pth = str(safe_output_path(
+                            cfg.results_path, "usb_",
+                            dev.get("serial_number") or dev.get("product") or "unknown", ".json"))
+                        save_json(dev, pth)
+                    except (OSError, ValueError) as e:
+                        session.record_error("usb_save", e)
+            else:
+                console.print("  [dim]No USB devices are currently connected "
+                              "(enumeration succeeded and returned none).[/dim]")
 
-    # ── LAN ───────────────────────────────────────────────────────────────────
+    # ── LAN ─────────────────────────────────────────────────────────────────
     if cfg.lan_enabled:
         console.print("\n  [bold cyan][ LAN DEVICES ][/bold cyan]")
-        arp_results = _arp_scan(subnet)
-        if not arp_results:
-            console.print("  [yellow]No ARP responses. Are you on a LAN? (requires sudo)[/yellow]\n")
+        if not caps["capture"].available:
+            reason = caps["capture"].reason
+            data["lan"] = {"status": "UNAVAILABLE", "reason": reason, "devices": []}
+            session.record_unavailable("LAN discovery", reason)
+            console.print("  [yellow]LAN discovery: UNAVAILABLE[/yellow]  [dim]{}[/dim]".format(esc(reason)))
         else:
-            console.print(f"  [green]{len(arp_results)} device(s) discovered[/green]\n")
-            t = Table(box=box.SIMPLE_HEAVY,show_header=True,header_style="dim",padding=(0,1))
-            t.add_column("IP",style="cyan"); t.add_column("MAC"); t.add_column("VENDOR"); t.add_column("HOSTNAME"); t.add_column("RISK")
-            for e in arp_results:
-                t.add_row(e["ip"],e["mac"],_mac_lookup(e["mac"]),"resolving...","—")
-            console.print(t); console.print()
+            console.print("  [dim]source: ARP sweep (OBSERVED)[/dim]")
+            arp = _arp_scan(subnet)
+            if not arp:
+                data["lan"] = {"status": "COMPLETED", "devices": [],
+                               "note": "no ARP replies received"}
+                console.print("  [yellow]No ARP replies received.[/yellow]")
+                console.print("  [dim]Nothing was observed - this is not proof the network is empty. "
+                              "ARP replies may be filtered, or the subnet may be wrong.[/dim]")
+            else:
+                console.print("  [green]{} host(s) replied to ARP[/green]\n".format(len(arp)))
+                if cfg.nmap_enabled and not caps["nmap"].available:
+                    session.record_unavailable("Active port scan (nmap)", caps["nmap"].reason)
+                    console.print("  [yellow]Nmap scan: UNAVAILABLE[/yellow]  [dim]{}[/dim]".format(
+                        esc(caps["nmap"].reason)))
+                devices = []
+                for entry in arp:
+                    if stop.is_set():
+                        session.note_limitation("LAN profiling stopped early on request.")
+                        break
+                    try:
+                        dev = _profile_lan_device(entry["ip"], entry["mac"], cfg, subnet or "")
+                        devices.append(dev)
+                        _print_lan(dev)
+                        pth = str(Path(cfg.results_path) /
+                                  "lan_{}.json".format(entry["ip"].replace(".", "_")))
+                        save_json(dev, pth)
+                    except Exception as e:
+                        session.record_error("lan_profile:{}".format(entry.get("ip")), e)
+                        console.print("  [red]Could not profile {}:[/red] {}".format(
+                            esc(entry.get("ip", "?")), e))
+                data["lan"] = {"status": "OBSERVED", "devices": devices}
+                session.count("lan_devices", len(devices))
 
-            for e in arp_results:
-                dev = _profile_lan_device(e["ip"],e["mac"],cfg,subnet or "")
-                session_data["lan_devices"].append(dev)
-                _print_lan(dev)
-                p = f"{cfg.results_path}/lan_{e['ip'].replace('.','_')}.json"
-                save_json(dev,p); console.print(f"  [dim]Saved →[/dim] [cyan]{p}[/cyan]")
+    session.finish(completed=True)
+    data["session"] = session.to_dict()
+    data["capabilities"] = [c.as_dict() for c in caps.values()]
 
-    # ── Enject JSON report ────────────────────────────────────────────────────
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    enject_path = f"{cfg.results_path}/forensics_enject_{ts}.json"
-    _generate_enject_report(session_data, enject_path)
+    _write_forensics_reports(session, cfg, data)
+    return session
 
-    html_path = f"{cfg.results_path}/forensics_report_{ts}.html"
+
+def _write_forensics_reports(session, cfg, data) -> None:
+    """Write forensics artifacts for THIS session."""
+    stamp = timestamp_filename()
+    base = Path(cfg.results_path)
+    ensure_dir(cfg.results_path)
+    sd = session.to_dict()
+
+    json_path = str(base / "forensics_{}.json".format(stamp))
     try:
-        _generate_forensics_report(session_data, html_path)
+        save_json(data, json_path)
+        console.print("\n  [dim]JSON ->[/dim] [cyan]{}[/cyan]".format(json_path))
+    except (OSError, TypeError) as e:
+        session.record_error("forensics_json", e)
+
+    html_path = str(base / "forensics_{}.html".format(stamp))
+    try:
+        _generate_forensics_report(data, html_path)
+        console.print("  [dim]HTML ->[/dim] [cyan]{}[/cyan]".format(html_path))
     except Exception as e:
-        log.debug(f"Could not generate HTML forensics report: {e}")
-        html_path = ""
+        session.record_error("forensics_html", e)
+        console.print("  [yellow]HTML report FAILED:[/yellow] {}".format(e))
 
-    pdf_path = f"{cfg.results_path}/forensics_report_{ts}.pdf"
+    pdf_path = str(base / "forensics_{}.pdf".format(stamp))
     try:
+        usb = data.get("usb", {})
+        lan = data.get("lan", {})
+        host = data.get("host", {})
         save_report_pdf(
             "PACKETPULSE FORENSICS REPORT",
-            "PacketPulse | Dreamwalker4u",
+            "Session {}".format(sd["session_id"]),
             [
-                ("Summary", [
-                    f"Host: {session_data['local_machine'].get('hostname','unknown')}",
-                    f"OS: {session_data['local_machine'].get('os','unknown')} {session_data['local_machine'].get('os_release','')}",
-                    f"USB devices: {len(session_data['usb_devices']):,}",
-                    f"LAN devices: {len(session_data['lan_devices']):,}",
-                    f"Critical LAN devices: {len([d for d in session_data['lan_devices'] if d.get('risk') == 'CRITICAL']):,}",
-                    f"New USB devices: {len([d for d in session_data['usb_devices'] if d.get('risk') == 'NEW_DEVICE']):,}",
+                ("Session", [
+                    "Session ID: {}".format(sd["session_id"]),
+                    "Status: {}".format(sd["status"]),
+                    "Started: {}".format(sd["started_at"]),
+                    "Ended: {}".format(sd["ended_at"]),
+                    "Host: {} ({} {})".format(host.get("hostname", UNKNOWN_VALUE),
+                                              host.get("os", UNKNOWN_VALUE),
+                                              host.get("os_release", "")),
                 ]),
-                ("USB Devices", [
-                    f"{dev.get('product','')} ({dev.get('manufacturer','')}) — {dev.get('risk','')}"
-                    for dev in session_data['usb_devices'][:20]
-                ] or ["No USB devices"]),
-                ("LAN Devices", [
-                    f"{dev.get('ip','')} / {dev.get('hostname','')} — {dev.get('risk','')}"
-                    for dev in session_data['lan_devices'][:20]
-                ] or ["No LAN devices"]),
+                ("USB", [
+                    "Status: {}".format(usb.get("status")),
+                    "Reason: {}".format(usb.get("reason", "n/a")),
+                    "Devices observed: {}".format(len(usb.get("devices", []))),
+                ]),
+                ("LAN", [
+                    "Status: {}".format(lan.get("status")),
+                    "Reason: {}".format(lan.get("reason", "n/a")),
+                    "Hosts observed: {}".format(len(lan.get("devices", []))),
+                ] + [
+                    "{} / {} - {}".format(d.get("ip", "?"), d.get("mac", "?"),
+                                          (d.get("os_fingerprint") or {}).get("likely_os", UNKNOWN_VALUE))
+                    for d in lan.get("devices", [])[:20]
+                ]),
+                ("Unavailable", ["{}: {}".format(u["feature"], u["reason"])
+                                 for u in sd["unavailable_features"]] or ["Nothing unavailable"]),
+                ("Limitations", sd["limitations"] or ["None recorded"]),
             ],
             pdf_path,
         )
-    except Exception as e:
-        log.debug(f"Could not generate PDF forensics report: {e}")
-        pdf_path = ""
+        console.print("  [dim]PDF  ->[/dim] [cyan]{}[/cyan]".format(pdf_path))
+    except (OSError, ValueError, RuntimeError) as e:
+        session.record_error("forensics_pdf", e)
+        console.print("  [yellow]PDF report FAILED:[/yellow] {}".format(e))
 
-    console.print(f"\n[bold green]╔═══════════════════════════════════════════════════════╗[/bold green]")
-    console.print(f"[bold green]║  FORENSICS REPORT  —  PacketPulse | Dreamwalker4u    ║[/bold green]")
-    console.print(f"[bold green]╚═══════════════════════════════════════════════════════╝[/bold green]")
-    console.print(f"  [dim]Enject JSON  →[/dim] [bold cyan]{enject_path}[/bold cyan]")
-    if html_path:
-        console.print(f"  [dim]HTML Report  →[/dim] [bold cyan]{html_path}[/bold cyan]")
-    if pdf_path:
-        console.print(f"  [dim]PDF Report   →[/dim] [bold cyan]{pdf_path}[/bold cyan]")
-    crit = [d["ip"] for d in session_data["lan_devices"] if d.get("risk")=="CRITICAL"]
-    new_usb = [d["product"] for d in session_data["usb_devices"] if d.get("risk")=="NEW_DEVICE"]
-    if crit:    console.print(f"  [bold red]CRITICAL LAN DEVICES:[/bold red] {', '.join(crit)}")
-    if new_usb: console.print(f"  [bold red]NEW USB DEVICES:[/bold red] {', '.join(new_usb)}")
-    console.print()
+    console.print("\n  [bold]{}[/bold]".format(session.summary_line()))
+    if sd["unavailable_features"]:
+        console.print("  [yellow]Unavailable this run:[/yellow]")
+        for u in sd["unavailable_features"]:
+            console.print("    [dim]- {}: {}[/dim]".format(esc(u["feature"]), esc(u["reason"])))
 
 
 def run_usb_watch() -> None:
@@ -1042,7 +1289,7 @@ def run_usb_watch() -> None:
             serial   = dev.get("ID_SERIAL_SHORT") or ""
             vid      = dev.get("ID_VENDOR_ID","")
             pid      = dev.get("ID_MODEL_ID","")
-            ts       = datetime.utcnow().strftime("%H:%M:%S")
+            ts       = utc_now().strftime("%H:%M:%S")
             if action == "add":
                 seen = _device_history.get(serial,0)
                 new_flag = "[bold red]  ← NEW DEVICE (first time seen)[/bold red]" if seen==0 else f"  [dim](seen {seen} times before)[/dim]"
