@@ -19,6 +19,8 @@ on:
           - testpypi
           - pypi
   push:
+    branches:
+      - main
     tags:
       - "v*"
   pull_request:
