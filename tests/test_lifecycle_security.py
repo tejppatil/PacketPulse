@@ -40,12 +40,15 @@ def test_duration_honored_judged_on_capture_window():
 
 def test_open_ended_run_has_no_duration_claim():
     s = Session(module="test", requested_duration=0)
-    s.begin_capture(); s.end_capture(); s.finish()
+    s.begin_capture()
+    s.end_capture()
+    s.finish()
     assert s.duration_honored() is None
 
 
 def test_status_reflects_what_happened():
-    ok = Session(module="t"); ok.finish(completed=True)
+    ok = Session(module="t")
+    ok.finish(completed=True)
     assert ok.status() == "PASS"
 
     partial = Session(module="t")
@@ -130,7 +133,8 @@ def test_untrusted_names_cannot_escape_the_output_directory(tmp_path, hostile):
 
 
 def test_distinct_hostile_names_do_not_collide(tmp_path):
-    base = tmp_path / "r"; base.mkdir()
+    base = tmp_path / "r"
+    base.mkdir()
     a = safe_output_path(str(base), "f_", "../../evil", ".json")
     b = safe_output_path(str(base), "f_", "../../../evil", ".json")
     assert a != b, "different inputs must not overwrite each other"

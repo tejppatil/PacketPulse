@@ -365,7 +365,7 @@ def save_report_pdf(title: str, subtitle: str, sections: list[tuple[str, list[st
 
     # Extract key/value lines from sections for dashboard cards.
     kv_pairs: list[tuple[str, str]] = []
-    for heading, lines in sections:
+    for _heading, lines in sections:
         for line in lines:
             if ":" in line:
                 left, right = line.split(":", 1)

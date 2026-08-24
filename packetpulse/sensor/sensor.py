@@ -946,7 +946,7 @@ def _generate_report(save_path: str, session) -> str:
     conn_list=list(_connections.values())[:60]
     http_list=_http_requests[:60]
     country_counts:dict[str,int]=defaultdict(int)
-    for ip, g in _ips_seen.items():
+    for _ip, g in _ips_seen.items():
         if not (g.get("available") or g.get("source") == "local"):
             continue
         c = g.get("country")
@@ -1931,7 +1931,7 @@ def _generate_pdf_report(save_path: str, session) -> str:
     x = margin
     _apply_fill(palette["panel"])
     c.rect(margin, chart_top - chart_h, content_w, chart_h, stroke=0, fill=1)
-    for idx, (sec, val) in enumerate(timeline_top):
+    for idx, (_sec, val) in enumerate(timeline_top):
         bh = int((val / timeline_max) * (chart_h - 16)) if timeline_max else 0
         _apply_fill(palette["cyan"] if idx % 2 == 0 else palette["green"])
         c.rect(x, chart_top - bh - 6, bar_w - 1, bh, stroke=0, fill=1)
